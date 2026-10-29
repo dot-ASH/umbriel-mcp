@@ -1,3 +1,4 @@
+mod doctor;
 mod input;
 mod ipc;
 mod keyboard;
@@ -532,22 +533,34 @@ impl ServerHandler for UmbrielServer {
 #[derive(Parser)]
 #[command(version, about = "MCP server for the Umbriel Wayland compositor")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// How much authority the server grants: read-only observes only, no-exec adds input and
     /// window control but cannot start programs, full allows everything
     #[arg(long, value_enum, default_value_t = Profile::Full)]
     profile: Profile,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Check that Umbriel, its input protocols, screen capture, and OCR are ready
+    Doctor,
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
+    if let Some(Command::Doctor) = cli.command {
+        return Ok(doctor::run());
+    }
     let service = UmbrielServer {
         profile: cli.profile,
     }
     .serve(stdio())
     .await?;
     service.waiting().await?;
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

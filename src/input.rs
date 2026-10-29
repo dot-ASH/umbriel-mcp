@@ -99,6 +99,14 @@ pub(crate) struct InputGlobals {
         Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
 }
 
+pub fn input_protocol_support() -> Result<(bool, bool)> {
+    let (_connection, _queue, globals) = discover_input_globals()?;
+    Ok((
+        globals.pointer_manager.is_some(),
+        globals.keyboard_manager.is_some(),
+    ))
+}
+
 pub(crate) fn discover_input_globals()
 -> Result<(Connection, EventQueue<InputGlobals>, InputGlobals)> {
     let connection = Connection::connect_to_env()

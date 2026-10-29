@@ -6,7 +6,7 @@ use std::time::Duration;
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn socket_path() -> Result<String> {
+pub fn socket_path() -> Result<String> {
     if let Ok(explicit) = std::env::var("UMBRIEL_SOCKET") {
         return Ok(explicit);
     }

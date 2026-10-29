@@ -63,6 +63,14 @@ Register it as a stdio server with your MCP client:
 }
 ```
 
+## Checking your setup
+
+`umbriel-mcp doctor` verifies that the Umbriel socket is reachable, that the compositor
+offers the virtual-pointer and virtual-keyboard protocols, and that `grim`, `tesseract`, and
+Tesseract's English data are installed. Each problem is listed on its own with the command to
+fix it on Arch, Debian/Ubuntu, and Fedora, or generic advice on other distributions. It exits
+with status 0 only when everything is ready.
+
 ## Profiles
 
 `--profile` limits what the server will do. Every tool stays visible in every profile; a
