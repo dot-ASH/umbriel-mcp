@@ -1,5 +1,6 @@
 mod input;
 mod ipc;
+mod keyboard;
 mod profile;
 mod screen;
 
@@ -18,7 +19,7 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router}
 use serde::Deserialize;
 
 fn failed(error: anyhow::Error) -> ErrorData {
-    ErrorData::internal_error(error.to_string(), None)
+    ErrorData::internal_error(format!("{error:#}"), None)
 }
 
 fn as_pretty_json(value: serde_json::Value) -> Result<String, ErrorData> {

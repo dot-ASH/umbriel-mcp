@@ -92,6 +92,10 @@ type into a focused terminal can still run commands through the input tools.
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
 `click_text`, `clipboard_read`, `clipboard_write`
 
+`key_press` takes chords such as `ctrl+shift+Tab`, `super+q`, `F5` or `alt+Left`; an uppercase
+letter (`ctrl+A`) implies Shift. `type_text` accepts any Unicode text, with `\n` typed as Return
+and `\t` as Tab.
+
 `run_action` accepts any action from `umbriel msg --help`, so the compositor's full verb
 set stays reachable even where there is no dedicated tool.
 

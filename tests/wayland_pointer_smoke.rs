@@ -547,14 +547,45 @@ fn wait_for_position(
     }
 }
 
-#[test]
-#[ignore = "requires a running Umbriel session and kitty"]
-fn mcp_virtual_keyboard_types_unicode_and_key_chords() {
-    let path = std::env::temp_dir().join(format!("umbriel-mcp-input-{}.txt", std::process::id()));
-    let command = format!(
-        "kitty --title=umbriel-mcp-input-smoke -e sh -c 'cat > {}'",
-        path.display()
-    );
+fn wait_until_active(mcp: &mut McpProcess, window_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = mcp.call_tool("get_active_window", json!({}));
+        let active = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        if active.contains(window_id) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "window never became active");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_until_window_closes(mcp: &mut McpProcess, window_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = mcp.call_tool("list_windows", json!({}));
+        let windows = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        if !windows.contains(window_id) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ctrl+d did not end the terminal's input, so it never reached the window as EOF"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn capture_terminal_output(title: &str, interact: impl FnOnce(&mut McpProcess)) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "umbriel-mcp-input-{}-{title}.txt",
+        std::process::id()
+    ));
+    let command = format!("kitty --title={title} -e sh -c 'cat > {}'", path.display());
     let mut mcp = McpProcess::start();
     let launched = mcp.call_tool("launch_app", json!({"command":command}));
     assert!(
@@ -573,7 +604,7 @@ fn mcp_virtual_keyboard_types_unicode_and_key_chords() {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|window| window["title"].as_str() == Some("umbriel-mcp-input-smoke"))
+            .find(|window| window["title"].as_str() == Some(title))
             .and_then(|window| window["id"].as_str())
         {
             break id.to_string();
@@ -587,21 +618,98 @@ fn mcp_virtual_keyboard_types_unicode_and_key_chords() {
         focused.get("result").is_some(),
         "focus_window failed: {focused}"
     );
-    let typed = mcp.call_tool("type_text", json!({"text":"Umbriel MCP — Unicode ✓"}));
-    assert!(typed.get("result").is_some(), "type_text failed: {typed}");
-    let newline = mcp.call_tool("key_press", json!({"keys":"Return"}));
-    assert!(newline.get("result").is_some(), "Return failed: {newline}");
+    wait_until_active(&mut mcp, &window_id);
+    interact(&mut mcp);
     let eof = mcp.call_tool("key_press", json!({"keys":"ctrl+d"}));
     assert!(eof.get("result").is_some(), "ctrl+d failed: {eof}");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_until_window_closes(&mut mcp, &window_id);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous = String::new();
     let actual = loop {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) if contents.contains("Unicode") => break contents,
-            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            other => panic!("typed test file was not produced: {other:?}"),
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        if !current.is_empty() && current == previous {
+            break current;
         }
+        assert!(
+            Instant::now() < deadline,
+            "typed output never settled; last read {current:?}"
+        );
+        previous = current;
+        std::thread::sleep(Duration::from_millis(300));
     };
-    assert_eq!(actual, "Umbriel MCP — Unicode ✓\n");
     let _ = std::fs::remove_file(path);
+    actual
+}
+
+fn assert_tool_succeeded(mcp: &mut McpProcess, tool: &str, arguments: Value) {
+    let response = mcp.call_tool(tool, arguments);
+    assert!(
+        response.get("result").is_some(),
+        "{tool} failed: {response}"
+    );
+}
+
+#[test]
+#[ignore = "requires a running Umbriel session and kitty"]
+fn mcp_virtual_keyboard_types_unicode_and_key_chords() {
+    let actual = capture_terminal_output("umbriel-mcp-input-smoke", |mcp| {
+        assert_tool_succeeded(mcp, "type_text", json!({"text":"Umbriel MCP — Unicode ✓"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"Return"}));
+    });
+    assert_eq!(actual, "Umbriel MCP — Unicode ✓\n");
+}
+
+#[test]
+#[ignore = "requires a running Umbriel session and kitty"]
+fn mcp_virtual_keyboard_releases_modifiers_after_each_chord() {
+    let actual = capture_terminal_output("umbriel-mcp-modifier-smoke", |mcp| {
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"shift+a"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"a"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"A"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"a"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"Return"}));
+    });
+    assert_eq!(actual, "AaAa\n");
+}
+
+#[test]
+#[ignore = "requires a running Umbriel session and kitty"]
+fn mcp_virtual_keyboard_types_more_distinct_characters_than_one_keymap_holds() {
+    let many_distinct: String = (0..450u32)
+        .map(|offset| char::from_u32(0x4E00 + offset).expect("valid CJK code point"))
+        .collect();
+    let text = format!("Hello, World! ÅÄÖ 日本語 😀 {many_distinct} end");
+    let expected = format!("{text}\n");
+    let actual = capture_terminal_output("umbriel-mcp-chunk-smoke", |mcp| {
+        assert_tool_succeeded(mcp, "type_text", json!({"text":text}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"Return"}));
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "requires a running Umbriel session and kitty"]
+fn mcp_virtual_keyboard_types_multiline_text_and_tabs() {
+    let actual = capture_terminal_output("umbriel-mcp-newline-smoke", |mcp| {
+        assert_tool_succeeded(mcp, "type_text", json!({"text":"one\ntwo\r\nthree"}));
+        assert_tool_succeeded(mcp, "key_press", json!({"keys":"Return"}));
+    });
+    assert_eq!(actual, "one\ntwo\nthree\n");
+}
+
+#[test]
+#[ignore = "requires a running Umbriel session and kitty"]
+fn mcp_virtual_keyboard_rejects_uncomposable_input_before_typing_anything() {
+    let mut mcp = McpProcess::start();
+    let bad_text = mcp.call_tool("type_text", json!({"text":"fine\u{7}bell"}));
+    assert!(
+        bad_text["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("control character")),
+        "{bad_text}"
+    );
+    let bad_chord = mcp.call_tool("key_press", json!({"keys":"ctrl+nonsense"}));
+    assert!(bad_chord.get("error").is_some(), "{bad_chord}");
 }

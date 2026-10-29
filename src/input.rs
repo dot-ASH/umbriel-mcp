@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use serde_json::Value;
 use std::io::Read;
 use std::sync::{Mutex, OnceLock};
@@ -93,10 +92,24 @@ fn output_dimension(output: &Value, dimension: &str) -> Result<i64> {
 }
 
 #[derive(Default)]
-struct InputGlobals {
-    seat: Option<wl_seat::WlSeat>,
+pub(crate) struct InputGlobals {
+    pub(crate) seat: Option<wl_seat::WlSeat>,
     pointer_manager: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
-    keyboard_manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+    pub(crate) keyboard_manager:
+        Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
+}
+
+pub(crate) fn discover_input_globals()
+-> Result<(Connection, EventQueue<InputGlobals>, InputGlobals)> {
+    let connection = Connection::connect_to_env()
+        .context("cannot connect to Wayland; check WAYLAND_DISPLAY and XDG_RUNTIME_DIR")?;
+    let mut queue = connection.new_event_queue();
+    connection.display().get_registry(&queue.handle(), ());
+    let mut globals = InputGlobals::default();
+    queue
+        .roundtrip(&mut globals)
+        .context("could not discover Wayland input protocols")?;
+    Ok((connection, queue, globals))
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for InputGlobals {
@@ -190,16 +203,8 @@ struct WaylandPointer {
 
 impl WaylandPointer {
     fn connect() -> Result<Self> {
-        let connection = Connection::connect_to_env()
-            .context("cannot connect to Wayland; check WAYLAND_DISPLAY and XDG_RUNTIME_DIR")?;
-        let mut queue = connection.new_event_queue();
+        let (connection, mut queue, mut globals) = discover_input_globals()?;
         let queue_handle = queue.handle();
-        connection.display().get_registry(&queue_handle, ());
-        let mut globals = InputGlobals::default();
-        queue
-            .roundtrip(&mut globals)
-            .context("could not discover Wayland input protocols")?;
-
         let seat = globals
             .seat
             .as_ref()
@@ -282,26 +287,6 @@ fn wayland_pointer() -> Result<&'static Mutex<WaylandPointer>> {
         .ok_or_else(|| anyhow!("could not retain the Wayland virtual pointer"))
 }
 
-fn enigo() -> Result<Enigo> {
-    let connection = Connection::connect_to_env()
-        .context("cannot connect to Wayland; check WAYLAND_DISPLAY and XDG_RUNTIME_DIR")?;
-    let mut queue = connection.new_event_queue();
-    let queue_handle = queue.handle();
-    connection.display().get_registry(&queue_handle, ());
-    let mut globals = InputGlobals::default();
-    queue
-        .roundtrip(&mut globals)
-        .context("could not discover Wayland input protocols")?;
-    if globals.keyboard_manager.is_none() {
-        return Err(anyhow!(
-            "Umbriel does not expose zwp_virtual_keyboard_manager_v1; check for a restricted Wayland session"
-        ));
-    }
-    Enigo::new(&Settings::default()).map_err(|cause| {
-        anyhow!("could not initialize Umbriel's Wayland virtual keyboard: {cause}")
-    })
-}
-
 fn pointer_button_code(button: &str) -> Result<u32> {
     match button {
         "left" => Ok(0x110),
@@ -356,138 +341,7 @@ pub fn drag(from: (i32, i32), to: (i32, i32), button: &str) -> Result<()> {
     released
 }
 
-pub fn type_text(text: &str, delay_ms: u32) -> Result<()> {
-    let mut keyboard = enigo()?;
-    if delay_ms == 0 {
-        return keyboard.text(text).map_err(Into::into);
-    }
-    for character in text.chars() {
-        keyboard.key(Key::Unicode(character), Direction::Click)?;
-        std::thread::sleep(Duration::from_millis(u64::from(delay_ms)));
-    }
-    Ok(())
-}
-
-pub fn press_keys(chord: &str) -> Result<()> {
-    let mut parts = chord
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    let mut key = None;
-    let mut modifiers = Vec::new();
-    for part in parts.by_ref() {
-        if let Some(modifier) = modifier_key(part) {
-            modifiers.push(modifier);
-        } else if key.replace(parse_key(part)?).is_some() {
-            return Err(anyhow!(
-                "key chord {chord:?} has more than one non-modifier key"
-            ));
-        }
-    }
-    let key = key.ok_or_else(|| anyhow!("key chord {chord:?} does not contain a key"))?;
-    let mut keyboard = enigo()?;
-    let mut pressed = Vec::new();
-    let mut action_error = None;
-    for modifier in modifiers {
-        if let Err(error) = keyboard.key(modifier, Direction::Press) {
-            action_error = Some(error);
-            break;
-        }
-        pressed.push(modifier);
-    }
-    if action_error.is_none() {
-        action_error = keyboard.key(key, Direction::Click).err();
-    }
-    let mut release_error = None;
-    for modifier in pressed.into_iter().rev() {
-        if let Err(error) = keyboard.key(modifier, Direction::Release) {
-            release_error = Some(error);
-        }
-    }
-    if let Some(error) = action_error.or(release_error) {
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-fn modifier_key(name: &str) -> Option<Key> {
-    match name.to_ascii_lowercase().as_str() {
-        "ctrl" | "control" => Some(Key::Control),
-        "shift" => Some(Key::Shift),
-        "alt" => Some(Key::Alt),
-        "super" | "meta" | "win" | "logo" | "command" => Some(Key::Meta),
-        _ => None,
-    }
-}
-
-fn parse_key(name: &str) -> Result<Key> {
-    if name.chars().count() == 1 {
-        return Ok(Key::Unicode(name.chars().next().expect("one character")));
-    }
-    let key = match name.to_ascii_lowercase().as_str() {
-        "enter" | "return" => Key::Return,
-        "esc" | "escape" => Key::Escape,
-        "tab" => Key::Tab,
-        "space" => Key::Space,
-        "backspace" => Key::Backspace,
-        "delete" | "del" => Key::Delete,
-        "home" => Key::Home,
-        "end" => Key::End,
-        "pageup" | "page_up" => Key::PageUp,
-        "pagedown" | "page_down" => Key::PageDown,
-        "left" | "leftarrow" => Key::LeftArrow,
-        "right" | "rightarrow" => Key::RightArrow,
-        "up" | "uparrow" => Key::UpArrow,
-        "down" | "downarrow" => Key::DownArrow,
-        "capslock" => Key::CapsLock,
-        "insert" => Key::Insert,
-        "printscreen" => Key::PrintScr,
-        "pause" => Key::Pause,
-        function
-            if function.strip_prefix('f').is_some_and(|number| {
-                number
-                    .parse::<u8>()
-                    .is_ok_and(|number| (1..=24).contains(&number))
-            }) =>
-        {
-            return Ok(function_key(
-                function[1..].parse().expect("validated function key"),
-            ));
-        }
-        _ => return Err(anyhow!("unknown key {name:?} in key chord")),
-    };
-    Ok(key)
-}
-
-fn function_key(number: u8) -> Key {
-    match number {
-        1 => Key::F1,
-        2 => Key::F2,
-        3 => Key::F3,
-        4 => Key::F4,
-        5 => Key::F5,
-        6 => Key::F6,
-        7 => Key::F7,
-        8 => Key::F8,
-        9 => Key::F9,
-        10 => Key::F10,
-        11 => Key::F11,
-        12 => Key::F12,
-        13 => Key::F13,
-        14 => Key::F14,
-        15 => Key::F15,
-        16 => Key::F16,
-        17 => Key::F17,
-        18 => Key::F18,
-        19 => Key::F19,
-        20 => Key::F20,
-        21 => Key::F21,
-        22 => Key::F22,
-        23 => Key::F23,
-        24 => Key::F24,
-        _ => unreachable!("validated function key"),
-    }
-}
+pub use crate::keyboard::{press_keys, type_text};
 
 pub fn clipboard_read() -> Result<String> {
     let (mut reader, _) = paste::get_contents(
@@ -522,8 +376,7 @@ pub fn clipboard_write(text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopLayout, modifier_key, parse_key};
-    use enigo::Key;
+    use super::DesktopLayout;
     use serde_json::json;
 
     #[test]
@@ -562,14 +415,5 @@ mod tests {
         assert!(layout.absolute_position(-1, 0).is_err());
         assert!(layout.absolute_position(3840, 0).is_err());
         assert!(layout.absolute_position(0, 1080).is_err());
-    }
-
-    #[test]
-    fn key_chords_recognize_common_modifiers_and_named_keys() {
-        assert_eq!(modifier_key("ctrl"), Some(Key::Control));
-        assert_eq!(modifier_key("Super"), Some(Key::Meta));
-        assert_eq!(parse_key("Return").unwrap(), Key::Return);
-        assert_eq!(parse_key("c").unwrap(), Key::Unicode('c'));
-        assert!(parse_key("not-a-key").is_err());
     }
 }

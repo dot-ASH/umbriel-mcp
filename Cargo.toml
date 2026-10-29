@@ -17,7 +17,6 @@ exclude = ["/target", "/.github"]
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
-enigo = { version = "0.6.1", default-features = false, features = ["wayland"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 wayland-client = "0.31.15"
@@ -27,12 +26,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "process"] }
 wl-clipboard-rs = "0.9.5"
+rustix = { version = "1.1.6", features = ["fs", "event"] }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
-
-[dev-dependencies]
-rustix = { version = "1.1.6", features = ["event"] }
