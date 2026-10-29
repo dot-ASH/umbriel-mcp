@@ -9,8 +9,6 @@ license=('MIT')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('umbriel-git: the compositor this server controls'
-            'ydotool: pointer movement, clicks, scrolling and drags'
-            'wtype: text typing and key chords'
             'grim: screen capture'
             'wl-clipboard: clipboard read and write'
             'tesseract: OCR tools'

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use std::io::Cursor;
@@ -88,21 +88,14 @@ fn output_origin(output_name: &str) -> (i64, i64) {
     (0, 0)
 }
 
-pub fn capture(
-    output: Option<&str>,
-    window_id: Option<&str>,
-    max_width: u32,
-) -> Result<Capture> {
+pub fn capture(output: Option<&str>, window_id: Option<&str>, max_width: u32) -> Result<Capture> {
     let (png, origin) = match (output, window_id) {
         (_, Some(id)) => {
             let geometry = crate::ipc::window_geometry(id)?;
             let origin = parse_origin(&geometry);
             (grim(&["-g".into(), geometry])?, origin)
         }
-        (Some(name), None) => (
-            grim(&["-o".into(), name.to_string()])?,
-            output_origin(name),
-        ),
+        (Some(name), None) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
         (None, None) => (grim(&[])?, (0, 0)),
     };
 
@@ -178,13 +171,8 @@ pub fn find_text(image_bytes: &[u8], needle: &str) -> Result<Vec<TextMatch>> {
             continue;
         }
         let number = |index: usize| columns[index].parse::<f32>().unwrap_or(-1.0);
-        let (left, top, width, height, confidence) = (
-            number(6),
-            number(7),
-            number(8),
-            number(9),
-            number(10),
-        );
+        let (left, top, width, height, confidence) =
+            (number(6), number(7), number(8), number(9), number(10));
         if confidence < 0.0 {
             continue;
         }

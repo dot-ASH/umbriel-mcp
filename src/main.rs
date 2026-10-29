@@ -1,12 +1,12 @@
-mod ipc;
 mod input;
+mod ipc;
 mod screen;
 
-use base64::prelude::{Engine, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::transport::stdio;
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
 fn failed(error: anyhow::Error) -> ErrorData {
@@ -159,7 +159,9 @@ struct UmbrielServer;
 
 #[tool_router]
 impl UmbrielServer {
-    #[tool(description = "List open windows with id, app_id, title, geometry, output and workspace.")]
+    #[tool(
+        description = "List open windows with id, app_id, title, geometry, output and workspace."
+    )]
     fn list_windows(
         &self,
         Parameters(filter): Parameters<WindowFilter>,
@@ -187,7 +189,9 @@ impl UmbrielServer {
         as_pretty_json(ipc::query("workspaces").map_err(failed)?)
     }
 
-    #[tool(description = "List outputs (monitors) with position, modes, scale and active workspace.")]
+    #[tool(
+        description = "List outputs (monitors) with position, modes, scale and active workspace."
+    )]
     fn list_outputs(&self) -> Result<String, ErrorData> {
         as_pretty_json(ipc::query("outputs").map_err(failed)?)
     }
@@ -202,7 +206,9 @@ impl UmbrielServer {
         as_pretty_json(ipc::query("layers").map_err(failed)?)
     }
 
-    #[tool(description = "Switch to a workspace by position or name, optionally scoped to an output.")]
+    #[tool(
+        description = "Switch to a workspace by position or name, optionally scoped to an output."
+    )]
     fn switch_workspace(
         &self,
         Parameters(target): Parameters<WorkspaceTarget>,
@@ -235,7 +241,9 @@ impl UmbrielServer {
         acted(with_optional_target("window-close", &target.window_id))
     }
 
-    #[tool(description = "Kill the process owning a window; acts on the focused window when no id is given.")]
+    #[tool(
+        description = "Kill the process owning a window; acts on the focused window when no id is given."
+    )]
     fn kill_window(
         &self,
         Parameters(target): Parameters<WindowTarget>,
@@ -271,7 +279,9 @@ impl UmbrielServer {
         ))
     }
 
-    #[tool(description = "Resize the focused window by moving one edge by a signed fraction (-0.9 to 0.9).")]
+    #[tool(
+        description = "Resize the focused window by moving one edge by a signed fraction (-0.9 to 0.9)."
+    )]
     fn resize_window(
         &self,
         Parameters(request): Parameters<ResizeRequest>,
@@ -285,13 +295,15 @@ impl UmbrielServer {
                 return Err(ErrorData::invalid_params(
                     format!("unknown edge {other}; expected left, right, up or down"),
                     None,
-                ))
+                ));
             }
         };
         acted(format!("{verb}:{}", request.delta))
     }
 
-    #[tool(description = "Set the active workspace layout: scrolling, dwindle, master or floating.")]
+    #[tool(
+        description = "Set the active workspace layout: scrolling, dwindle, master or floating."
+    )]
     fn set_workspace_layout(
         &self,
         Parameters(request): Parameters<LayoutRequest>,
@@ -348,7 +360,10 @@ impl UmbrielServer {
     }
 
     #[tool(description = "Press at one point, drag to another, and release.")]
-    fn mouse_drag(&self, Parameters(request): Parameters<DragRequest>) -> Result<String, ErrorData> {
+    fn mouse_drag(
+        &self,
+        Parameters(request): Parameters<DragRequest>,
+    ) -> Result<String, ErrorData> {
         let button = request.button.unwrap_or_else(|| "left".to_string());
         input::drag(
             (request.from_x, request.from_y),
@@ -405,11 +420,16 @@ impl UmbrielServer {
         let recognised = screen::read_text(&shot.jpeg).map_err(failed)?;
         Ok(CallToolResult::success(vec![
             ContentBlock::image(BASE64_STANDARD.encode(&shot.jpeg), "image/jpeg"),
-            ContentBlock::text(format!("{}\n\nOCR text:\n{recognised}", shot.coordinate_note())),
+            ContentBlock::text(format!(
+                "{}\n\nOCR text:\n{recognised}",
+                shot.coordinate_note()
+            )),
         ]))
     }
 
-    #[tool(description = "Find text on screen and report absolute screen coordinates for each match.")]
+    #[tool(
+        description = "Find text on screen and report absolute screen coordinates for each match."
+    )]
     fn find_text_on_screen(
         &self,
         Parameters(request): Parameters<TextSearchRequest>,
@@ -445,9 +465,9 @@ impl UmbrielServer {
             .map_err(failed)?;
         let factor = shot.native_width as f64 / shot.encoded_width.max(1) as f64;
         let found = screen::find_text(&shot.jpeg, &request.target).map_err(failed)?;
-        let best = found
-            .first()
-            .ok_or_else(|| ErrorData::internal_error(format!("no match for {:?}", request.target), None))?;
+        let best = found.first().ok_or_else(|| {
+            ErrorData::internal_error(format!("no match for {:?}", request.target), None)
+        })?;
 
         let x = (best.center_x as f64 * factor).round() as i64 + shot.origin_x;
         let y = (best.center_y as f64 * factor).round() as i64 + shot.origin_y;
@@ -467,7 +487,10 @@ impl UmbrielServer {
         Parameters(request): Parameters<ClipboardWriteRequest>,
     ) -> Result<String, ErrorData> {
         input::clipboard_write(&request.text).map_err(failed)?;
-        Ok(format!("copied {} characters", request.text.chars().count()))
+        Ok(format!(
+            "copied {} characters",
+            request.text.chars().count()
+        ))
     }
 }
 

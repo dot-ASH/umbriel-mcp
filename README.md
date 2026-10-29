@@ -37,15 +37,13 @@ install -Dm755 target/release/umbriel-mcp ~/.local/bin/umbriel-mcp
 | Tool | Used for | Arch package |
 |---|---|---|
 | Umbriel | compositor IPC | `umbriel-git` |
-| `ydotool` + `ydotoold` | pointer move, click, scroll, drag | `ydotool` |
-| `wtype` | typing and key chords | `wtype` |
 | `grim` | screen capture | `grim` |
 | `wl-clipboard` | clipboard read and write | `wl-clipboard` |
 | `tesseract` + English data | OCR tools only | `tesseract`, `tesseract-data-eng` |
 
-Only Umbriel itself is needed for the inspection and window-control tools. The helpers are
-required for the tool groups that use them, and `ydotoold` must be running for any
-pointer tool.
+Pointer and keyboard input use Umbriel's Wayland virtual-pointer and virtual-keyboard
+protocols directly, so no input daemon, device permissions, or privileged group are needed.
+Only the screen-capture, clipboard, and OCR tools depend on the helpers above.
 
 The socket is found through `UMBRIEL_SOCKET`, falling back to
 `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock`.
