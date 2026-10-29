@@ -10,7 +10,6 @@ depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('umbriel-git: the compositor this server controls'
             'grim: screen capture'
-            'wl-clipboard: clipboard read and write'
             'tesseract: OCR tools'
             'tesseract-data-eng: English OCR language data')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")

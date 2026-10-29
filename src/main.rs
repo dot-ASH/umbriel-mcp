@@ -1,10 +1,18 @@
 mod input;
 mod ipc;
+mod profile;
 mod screen;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
+use clap::Parser;
+use profile::Profile;
+use rmcp::RoleServer;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
@@ -20,6 +28,10 @@ fn as_pretty_json(value: serde_json::Value) -> Result<String, ErrorData> {
 fn acted(action: String) -> Result<String, ErrorData> {
     ipc::dispatch(&action).map_err(failed)?;
     Ok(format!("ok: {action}"))
+}
+
+fn refused(reason: String) -> ErrorData {
+    ErrorData::invalid_request(reason, None)
 }
 
 fn with_optional_target(base: &str, target: &Option<String>) -> String {
@@ -155,7 +167,9 @@ struct LayoutRequest {
 }
 
 #[derive(Clone)]
-struct UmbrielServer;
+struct UmbrielServer {
+    profile: Profile,
+}
 
 #[tool_router]
 impl UmbrielServer {
@@ -326,6 +340,9 @@ impl UmbrielServer {
 
     #[tool(description = "Run any raw umbriel action, for anything the other tools do not cover.")]
     fn run_action(&self, Parameters(request): Parameters<RawAction>) -> Result<String, ErrorData> {
+        self.profile
+            .permit_action(&request.action)
+            .map_err(refused)?;
         acted(request.action)
     }
 
@@ -499,11 +516,61 @@ impl UmbrielServer {
     version = "0.1.0",
     instructions = "Inspect and control the Umbriel Wayland compositor: windows, workspaces, outputs, pointer and keyboard input, screenshots with OCR, and the clipboard. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool."
 )]
-impl ServerHandler for UmbrielServer {}
+impl ServerHandler for UmbrielServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.profile.permit_tool(&request.name).map_err(refused)?;
+        let tool_call = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tool_call).await
+    }
+}
+
+#[derive(Parser)]
+#[command(version, about = "MCP server for the Umbriel Wayland compositor")]
+struct Cli {
+    /// How much authority the server grants: read-only observes only, no-exec adds input and
+    /// window control but cannot start programs, full allows everything
+    #[arg(long, value_enum, default_value_t = Profile::Full)]
+    profile: Profile,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let service = UmbrielServer.serve(stdio()).await?;
+    let cli = Cli::parse();
+    let service = UmbrielServer {
+        profile: cli.profile,
+    }
+    .serve(stdio())
+    .await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UmbrielServer;
+    use crate::profile::TOOL_ACCESS;
+
+    #[test]
+    fn every_advertised_tool_is_explicitly_classified_and_nothing_stale_remains() {
+        let mut advertised: Vec<String> = UmbrielServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let mut classified: Vec<String> = TOOL_ACCESS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        advertised.sort();
+        classified.sort();
+
+        assert_eq!(
+            advertised, classified,
+            "TOOL_ACCESS must list exactly the advertised tools"
+        );
+    }
 }

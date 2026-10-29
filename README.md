@@ -38,12 +38,12 @@ install -Dm755 target/release/umbriel-mcp ~/.local/bin/umbriel-mcp
 |---|---|---|
 | Umbriel | compositor IPC | `umbriel-git` |
 | `grim` | screen capture | `grim` |
-| `wl-clipboard` | clipboard read and write | `wl-clipboard` |
 | `tesseract` + English data | OCR tools only | `tesseract`, `tesseract-data-eng` |
 
 Pointer and keyboard input use Umbriel's Wayland virtual-pointer and virtual-keyboard
 protocols directly, so no input daemon, device permissions, or privileged group are needed.
-Only the screen-capture, clipboard, and OCR tools depend on the helpers above.
+Clipboard access also talks to the compositor directly (the data-control protocol). Only
+the screen-capture and OCR tools depend on the helpers above.
 
 The socket is found through `UMBRIEL_SOCKET`, falling back to
 `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock`.
@@ -62,6 +62,20 @@ Register it as a stdio server with your MCP client:
   }
 }
 ```
+
+## Profiles
+
+`--profile` limits what the server will do. Every tool stays visible in every profile; a
+call the profile does not allow returns an error that names the profile.
+
+| Profile | Allows |
+|---|---|
+| `full` (default) | everything, including `launch_app` and spawn actions |
+| `no-exec` | everything except starting programs: `launch_app` and any `run_action` that spawns are refused |
+| `read-only` | queries, screenshots, OCR, and reading the clipboard |
+
+`no-exec` stops the server from starting programs; it is not a sandbox. An agent that can
+type into a focused terminal can still run commands through the input tools.
 
 ## Tools
 

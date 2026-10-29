@@ -119,7 +119,16 @@ struct McpProcess {
 
 impl McpProcess {
     fn start(socket_path: &std::path::Path) -> Self {
+        Self::start_with_args(socket_path, &[])
+    }
+
+    fn start_with_profile(socket_path: &std::path::Path, profile: &str) -> Self {
+        Self::start_with_args(socket_path, &["--profile", profile])
+    }
+
+    fn start_with_args(socket_path: &std::path::Path, args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
+            .args(args)
             .env("UMBRIEL_SOCKET", socket_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -342,4 +351,252 @@ fn mcp_client_receives_compositor_errors_as_tool_errors() {
             .is_some_and(|message| message.contains("window query denied by fake compositor")),
         "expected compositor error in MCP response, got {serialized}"
     );
+}
+
+const ALL_PROFILES: [&str; 3] = ["read-only", "no-exec", "full"];
+
+fn compositor_actions(fake: &FakeUmbriel) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|request| request["cmd"] == "msg")
+        .filter_map(|request| request["arg"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn error_message(response: &Value) -> String {
+    response["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error response, got {response}"))
+        .to_owned()
+}
+
+fn assert_refused_by_profile(response: &Value, profile: &str) {
+    let message = error_message(response);
+    assert!(
+        message.contains("profile") && message.contains(profile),
+        "refusal should name the profile `{profile}`, got: {message}"
+    );
+}
+
+fn assert_not_refused_by_profile(response: &Value) {
+    if let Some(message) = response["error"]["message"].as_str() {
+        assert!(
+            !message.contains("profile"),
+            "call should have passed the profile check, got: {message}"
+        );
+    }
+}
+
+fn advertised_tool_names(server: &mut McpProcess) -> Vec<String> {
+    let response = server.request("tools/list", json!({}));
+    let mut names: Vec<String> = response["result"]["tools"]
+        .as_array()
+        .expect("tool list")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn every_profile_still_advertises_every_tool() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut full = McpProcess::start(&fake.path);
+    let expected = advertised_tool_names(&mut full);
+    assert!(expected.contains(&"launch_app".to_string()));
+
+    for profile in ALL_PROFILES {
+        let mut server = McpProcess::start_with_profile(&fake.path, profile);
+        assert_eq!(
+            advertised_tool_names(&mut server),
+            expected,
+            "profile {profile} must not hide tools"
+        );
+    }
+}
+
+#[test]
+fn profile_defaults_to_full() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let response = server.call_tool("launch_app", json!({"command":"kitty"}));
+
+    assert_not_refused_by_profile(&response);
+    assert_eq!(compositor_actions(&fake), vec!["spawn:kitty"]);
+}
+
+#[test]
+fn full_profile_permits_launching_and_spawn_actions() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "full");
+
+    server.call_tool("launch_app", json!({"command":"kitty"}));
+    server.call_tool("run_action", json!({"action":"spawn:foot"}));
+    server.call_tool("run_action", json!({"action":"overview-toggle"}));
+
+    assert_eq!(
+        compositor_actions(&fake),
+        vec!["spawn:kitty", "spawn:foot", "overview-toggle"]
+    );
+}
+
+#[test]
+fn no_exec_profile_refuses_the_launch_tool() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "no-exec");
+
+    let response = server.call_tool("launch_app", json!({"command":"kitty"}));
+
+    assert_refused_by_profile(&response, "no-exec");
+    assert_eq!(compositor_actions(&fake), Vec::<String>::new());
+}
+
+#[test]
+fn no_exec_profile_refuses_every_spawn_form_through_run_action() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "no-exec");
+
+    for action in [
+        "spawn:kitty",
+        "SPAWN:kitty",
+        "  spawn:kitty",
+        "\tspawn:kitty",
+        "spawn kitty",
+        "spawn",
+        "Spawn:sh -c 'id'",
+    ] {
+        let response = server.call_tool("run_action", json!({"action":action}));
+        assert_refused_by_profile(&response, "no-exec");
+    }
+    assert_eq!(
+        compositor_actions(&fake),
+        Vec::<String>::new(),
+        "no spawn action may reach the compositor"
+    );
+}
+
+#[test]
+fn no_exec_profile_permits_window_and_workspace_control() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "no-exec");
+
+    server.call_tool("switch_workspace", json!({"workspace":"2","output":"DP-1"}));
+    server.call_tool("toggle_fullscreen", json!({}));
+    server.call_tool("close_window", json!({"window_id":"window-a"}));
+    server.call_tool("run_action", json!({"action":"overview-toggle"}));
+
+    assert_eq!(
+        compositor_actions(&fake),
+        vec![
+            "workspace-switch:2/DP-1",
+            "window-toggle-fullscreen",
+            "window-close:window-a",
+            "overview-toggle"
+        ]
+    );
+}
+
+#[test]
+fn no_exec_profile_permits_input_tools_past_the_profile_check() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "no-exec");
+
+    let key = server.call_tool("key_press", json!({"keys":"ctrl"}));
+    let click = server.call_tool("mouse_click", json!({"button":"not-a-button"}));
+
+    assert_not_refused_by_profile(&key);
+    assert_not_refused_by_profile(&click);
+    assert!(
+        error_message(&key).contains("key"),
+        "expected a chord error"
+    );
+    assert!(
+        error_message(&click).contains("button"),
+        "expected a button error"
+    );
+}
+
+#[test]
+fn read_only_profile_permits_queries() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "read-only");
+
+    for tool in [
+        "list_windows",
+        "list_workspaces",
+        "list_outputs",
+        "get_active_window",
+        "list_layers",
+    ] {
+        let response = server.call_tool(tool, json!({}));
+        assert!(
+            response.get("result").is_some(),
+            "{tool} should work read-only: {response}"
+        );
+    }
+}
+
+#[test]
+fn read_only_profile_refuses_every_state_changing_tool() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start_with_profile(&fake.path, "read-only");
+
+    let refused_calls = [
+        ("switch_workspace", json!({"workspace":"2"})),
+        ("focus_window", json!({"window_id":"window-a"})),
+        ("close_window", json!({})),
+        ("kill_window", json!({})),
+        ("move_window_to_workspace", json!({"workspace":"2"})),
+        ("toggle_fullscreen", json!({})),
+        ("toggle_floating", json!({})),
+        ("resize_window", json!({"edge":"left","delta":0.1})),
+        ("set_workspace_layout", json!({"mode":"dwindle"})),
+        ("toggle_overview", json!({})),
+        ("launch_app", json!({"command":"kitty"})),
+        ("run_action", json!({"action":"overview-toggle"})),
+        ("run_action", json!({"action":"spawn:kitty"})),
+        ("mouse_move", json!({"x":10,"y":10})),
+        ("mouse_click", json!({})),
+        ("mouse_scroll", json!({})),
+        (
+            "mouse_drag",
+            json!({"from_x":1,"from_y":1,"to_x":2,"to_y":2}),
+        ),
+        ("type_text", json!({"text":"hello"})),
+        ("key_press", json!({"keys":"Return"})),
+        ("click_text", json!({"target":"File"})),
+        ("clipboard_write", json!({"text":"hello"})),
+    ];
+    for (tool, arguments) in refused_calls {
+        let response = server.call_tool(tool, arguments);
+        assert_refused_by_profile(&response, "read-only");
+    }
+    assert_eq!(
+        compositor_actions(&fake),
+        Vec::<String>::new(),
+        "no state-changing request may reach the compositor"
+    );
+}
+
+#[test]
+fn an_unknown_profile_is_rejected_at_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
+        .args(["--profile", "bogus"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run MCP server binary");
+
+    assert!(
+        !output.status.success(),
+        "unknown profile must fail startup"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for allowed in ALL_PROFILES {
+        assert!(
+            stderr.contains(allowed),
+            "stderr should list `{allowed}`: {stderr}"
+        );
+    }
 }

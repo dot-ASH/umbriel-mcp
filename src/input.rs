@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use serde_json::Value;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{wl_pointer, wl_registry, wl_seat};
@@ -11,6 +10,8 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboar
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
+use wl_clipboard_rs::copy;
+use wl_clipboard_rs::paste::{self, ClipboardType, MimeType as PasteMimeType, Seat};
 
 #[derive(Clone, Copy)]
 struct DesktopLayout {
@@ -489,36 +490,34 @@ fn function_key(number: u8) -> Key {
 }
 
 pub fn clipboard_read() -> Result<String> {
-    let result = Command::new("wl-paste")
-        .arg("--no-newline")
-        .output()
-        .map_err(|cause| anyhow!("cannot run wl-paste: {cause}"))?;
-    if !result.status.success() {
-        return Err(anyhow!(
-            "wl-paste failed: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
-        ));
+    let (mut reader, _) = paste::get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        PasteMimeType::Text,
+    )
+    .map_err(describe_paste_failure)?;
+    let mut contents = Vec::new();
+    reader
+        .read_to_end(&mut contents)
+        .context("could not read the clipboard contents")?;
+    String::from_utf8(contents).map_err(|_| anyhow!("the clipboard text is not valid UTF-8"))
+}
+
+fn describe_paste_failure(error: paste::Error) -> anyhow::Error {
+    match error {
+        paste::Error::ClipboardEmpty => anyhow!("the clipboard is empty"),
+        paste::Error::NoMimeType => anyhow!("the clipboard holds no text"),
+        other => anyhow!("could not read the clipboard: {other}"),
     }
-    Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
 
 pub fn clipboard_write(text: &str) -> Result<()> {
-    let mut child = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|cause| anyhow!("cannot run wl-copy: {cause}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("wl-copy stdin unavailable"))?
-        .write_all(text.as_bytes())?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(anyhow!("wl-copy exited with {status}"));
-    }
-    Ok(())
+    copy::Options::new()
+        .copy(
+            copy::Source::Bytes(text.as_bytes().into()),
+            copy::MimeType::Text,
+        )
+        .map_err(|error| anyhow!("could not write the clipboard: {error}"))
 }
 
 #[cfg(test)]
