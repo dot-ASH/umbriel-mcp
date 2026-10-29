@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dot-ash/umbriel-mcp",
+  "title": "Umbriel",
+  "description": "Inspect and control the Umbriel Wayland compositor: windows, workspaces, outputs, pointer and keyboard input, screenshots with OCR, and the clipboard.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/dot-ASH/umbriel-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "umbriel-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

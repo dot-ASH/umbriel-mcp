@@ -1,0 +1,39 @@
+# Maintainer: Nafees Ashker Sakir <nafees.ashker@gmail.com>
+pkgname=umbriel-mcp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="MCP server for the Umbriel Wayland compositor: windows, workspaces, input, screenshots and clipboard"
+arch=('x86_64' 'aarch64')
+url="https://github.com/dot-ASH/umbriel-mcp"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('umbriel-git: the compositor this server controls'
+            'ydotool: pointer movement, clicks, scrolling and drags'
+            'wtype: text typing and key chords'
+            'grim: screen capture'
+            'wl-clipboard: clipboard read and write'
+            'tesseract: OCR tools'
+            'tesseract-data-eng: English OCR language data')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
