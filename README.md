@@ -26,43 +26,122 @@ promise beyond what I can do in my spare time.
 ## Compatibility
 
 Support follows Umbriel's own availability: if Umbriel runs on your system, this server
-should. Umbriel is packaged for Arch Linux (`umbriel-git`); on Ubuntu, 26.04 and newer is
-the supported path. Follow [Umbriel's installation page](https://docs.noctalia.dev/umbriel/)
-for your distribution.
+should. The server itself is a static binary for x86_64 and aarch64 Linux with no runtime
+libraries, so the distribution only matters for installing Umbriel and the two screen
+helpers.
+
+| Distribution | Umbriel | umbriel-mcp |
+|---|---|---|
+| Arch Linux | AUR `umbriel-git` | AUR `umbriel-mcp-bin` |
+| Ubuntu 26.04+ | Noctalia APT repository (`umbriel`) | release binary |
+| Debian Trixie / Sid | Noctalia APT repository (`umbriel`) | release binary |
+| Fedora | Terra (`umbriel-nightly`) | release binary |
+| anything else | see [Umbriel's installation page](https://docs.noctalia.dev/umbriel/installation/) | release binary or `cargo install` |
+
+Older Ubuntu releases are not supported because Umbriel is not packaged for them.
 
 **Warning for Arch users:** the AUR package named `umbriel` is a placeholder and is not
 the compositor. Do not install it; the compositor is `umbriel-git`.
 
 ## Install
 
-Pick one. All three give you an `umbriel-mcp` executable.
+Each path below installs Umbriel, the screen helpers, and `umbriel-mcp`, then checks the
+result. Skip the Umbriel step if you already run it. The Umbriel commands are copied from
+[its installation page](https://docs.noctalia.dev/umbriel/installation/); check there if
+they have changed.
 
-**Prebuilt binary (x86_64 and aarch64 Linux).** Static binaries with no runtime
-libraries, attached to each [GitHub release](https://github.com/dot-ASH/umbriel-mcp/releases):
-
-```sh
-arch=$(uname -m)   # x86_64 or aarch64
-tag=v0.1.0
-curl -LO "https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag/umbriel-mcp-$tag-$arch-linux.tar.gz"
-curl -LO "https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag/SHA256SUMS"
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf "umbriel-mcp-$tag-$arch-linux.tar.gz"
-install -Dm755 "umbriel-mcp-$tag-$arch-linux/umbriel-mcp" ~/.local/bin/umbriel-mcp
-```
-
-**Arch Linux (AUR):** `umbriel-mcp-bin` installs the same release binary without compiling.
+### Arch Linux
 
 ```sh
-yay -S umbriel-mcp-bin
+yay -S umbriel-git                                     # the compositor, if needed
+sudo pacman -S grim tesseract tesseract-data-eng       # screen capture and OCR
+yay -S umbriel-mcp-bin                                 # this server, prebuilt
+umbriel-mcp doctor
 ```
 
-**crates.io** (needs Rust 1.89 or newer):
+### Ubuntu 26.04 and newer
+
+1. Install Umbriel from the Noctalia APT repository (amd64 and arm64 only), if needed:
+
+   ```sh
+   wget https://pkg.noctalia.dev/deb/nickh-archive-keyring.deb
+   sudo dpkg -i nickh-archive-keyring.deb
+   sudo wget -O /etc/apt/sources.list.d/noctalia-resolute.sources \
+     https://pkg.noctalia.dev/deb/noctalia-resolute.sources
+   sudo apt update
+   sudo apt install umbriel
+   ```
+
+2. Install the screen helpers:
+
+   ```sh
+   sudo apt install grim tesseract-ocr tesseract-ocr-eng
+   ```
+
+3. Install the server from the latest [GitHub release](https://github.com/dot-ASH/umbriel-mcp/releases):
+
+   ```sh
+   arch=$(uname -m)   # x86_64 or aarch64
+   tag=v0.1.0
+   base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
+   curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
+   curl -LO "$base/SHA256SUMS"
+   sha256sum --check --ignore-missing SHA256SUMS
+   tar -xzf "umbriel-mcp-$tag-$arch-linux.tar.gz"
+   sudo install -Dm755 "umbriel-mcp-$tag-$arch-linux/umbriel-mcp" /usr/local/bin/umbriel-mcp
+   ```
+
+   `/usr/local/bin` is on every user's `PATH`, so harnesses started from the Umbriel session
+   find the binary without extra setup. To install without `sudo`, use
+   `~/.local/bin/umbriel-mcp` instead; Ubuntu adds `~/.local/bin` to `PATH` at login only if
+   the directory already existed, so log out and back in after creating it.
+
+4. Check the setup from a terminal inside the Umbriel session:
+
+   ```sh
+   umbriel-mcp doctor
+   ```
+
+### Debian Trixie and Sid
+
+Same as Ubuntu, with the Debian repository source and, on Trixie, the backports suite:
+
+```sh
+wget https://pkg.noctalia.dev/deb/nickh-archive-keyring.deb
+sudo dpkg -i nickh-archive-keyring.deb
+sudo wget -O /etc/apt/sources.list.d/noctalia-trixie.sources \
+  https://pkg.noctalia.dev/deb/noctalia-trixie.sources        # Sid: noctalia-unstable.sources
+sudo apt update
+sudo apt install -t trixie-backports umbriel                  # Sid: sudo apt install umbriel
+sudo apt install grim tesseract-ocr tesseract-ocr-eng
+```
+
+Then install the server from the release binary as in step 3 above and run
+`umbriel-mcp doctor`.
+
+### Fedora
+
+```sh
+sudo dnf install umbriel-nightly                              # from the Terra repository
+sudo dnf install grim tesseract tesseract-langpack-eng
+```
+
+Then install the server from the release binary as in Ubuntu step 3 and run
+`umbriel-mcp doctor`.
+
+### Other distributions
+
+Install Umbriel following [its installation page](https://docs.noctalia.dev/umbriel/installation/),
+then `grim`, `tesseract`, and Tesseract's English data (`eng.traineddata`) from your package
+manager. Install the server from the release binary as in Ubuntu step 3, or build it with
+Cargo (needs Rust 1.89 or newer, for example from [rustup](https://rustup.rs)):
 
 ```sh
 cargo install umbriel-mcp --locked
 ```
 
-That puts `umbriel-mcp` in `~/.cargo/bin`.
+`umbriel-mcp doctor` names the exact packages to install on Arch, Debian/Ubuntu, and Fedora,
+and gives generic guidance elsewhere.
 
 ## Requirements
 
@@ -76,7 +155,7 @@ external programs are needed only for the screen tools:
 | English OCR data | same | `tesseract-data-eng` | `tesseract-ocr-eng` | `tesseract-langpack-eng` |
 
 The tools are always listed; a call that needs a missing program fails with an error naming
-it. Run `umbriel-mcp doctor` (below) to find out what is missing.
+the package to install.
 
 The socket is found through `UMBRIEL_SOCKET`, falling back to
 `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock`.
