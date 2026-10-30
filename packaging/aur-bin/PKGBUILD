@@ -1,0 +1,27 @@
+# Maintainer: Nafees Ashker Sakir <nafees.ashker@gmail.com>
+pkgname=umbriel-mcp-bin
+_binary=umbriel-mcp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="MCP server for the Umbriel Wayland compositor (prebuilt static binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/dot-ASH/umbriel-mcp"
+license=('MIT')
+options=('!debug' '!strip')
+provides=("$_binary")
+conflicts=("$_binary")
+optdepends=('umbriel-git: the compositor this server controls'
+            'grim: screen capture'
+            'tesseract: OCR tools'
+            'tesseract-data-eng: English OCR language data')
+source_x86_64=("$_binary-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-x86_64-linux.tar.gz")
+source_aarch64=("$_binary-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-aarch64-linux.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "$_binary-v$pkgver-$CARCH-linux"
+  install -Dm755 "$_binary" "$pkgdir/usr/bin/$_binary"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -127,8 +127,17 @@ impl McpProcess {
     }
 
     fn start_with_args(socket_path: &std::path::Path, args: &[&str]) -> Self {
+        Self::start_with_environment(socket_path, args, &[])
+    }
+
+    fn start_with_environment(
+        socket_path: &std::path::Path,
+        args: &[&str],
+        environment: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
             .args(args)
+            .envs(environment.iter().copied())
             .env("UMBRIEL_SOCKET", socket_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -598,5 +607,120 @@ fn an_unknown_profile_is_rejected_at_startup() {
             stderr.contains(allowed),
             "stderr should list `{allowed}`: {stderr}"
         );
+    }
+}
+
+const OCR_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/ocr-ui-wide.png"
+);
+
+fn fake_tools_directory(
+    grim_script: Option<&str>,
+    tesseract_script: Option<&str>,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "umbriel-ocr-tools-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&directory).expect("create fake tools directory");
+    for (name, script) in [("grim", grim_script), ("tesseract", tesseract_script)] {
+        if let Some(script) = script {
+            let path = directory.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write fake tool");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+    directory
+}
+
+fn grim_that_captures_the_fixture() -> String {
+    format!("exec /usr/bin/cat '{OCR_FIXTURE}'")
+}
+
+fn start_with_tools(fake: &FakeUmbriel, tools: &std::path::Path, search_path: &str) -> McpProcess {
+    let path = format!("{}:{search_path}", tools.display());
+    McpProcess::start_with_environment(&fake.path, &[], &[("PATH", path.as_ref())])
+}
+
+#[test]
+fn ocr_tools_read_a_native_resolution_capture() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let tools = fake_tools_directory(Some(&grim_that_captures_the_fixture()), None);
+    let mut server = start_with_tools(&fake, &tools, "/usr/bin");
+
+    let screenshot = server.call_tool("screenshot_with_ocr", json!({}));
+    let found = server.call_tool("find_text_on_screen", json!({"target":"Cancel"}));
+    let phrase = server.call_tool("find_text_on_screen", json!({"target":"Open File"}));
+
+    let read = text_content(&screenshot);
+    for expected in ["Settings", "Save", "Cancel", "quick brown fox 12345"] {
+        assert!(
+            read.contains(expected),
+            "OCR text missing {expected:?}:\n{read}"
+        );
+    }
+    let located = text_content(&found);
+    assert!(
+        located.contains("Cancel") && located.contains("at screen (3"),
+        "{located}"
+    );
+    assert!(
+        text_content(&phrase).contains("\"Open File\""),
+        "{}",
+        text_content(&phrase)
+    );
+}
+
+#[test]
+fn ocr_tools_name_the_missing_program() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let tools = fake_tools_directory(Some(&grim_that_captures_the_fixture()), None);
+    let mut server = start_with_tools(&fake, &tools, "");
+
+    let response = server.call_tool("screenshot_with_ocr", json!({}));
+
+    let message = error_message(&response);
+    assert!(message.contains("tesseract"), "{message}");
+    assert!(message.contains("doctor"), "{message}");
+}
+
+#[test]
+fn ocr_tools_name_the_missing_language_package() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let tools = fake_tools_directory(
+        Some(&grim_that_captures_the_fixture()),
+        Some("echo 'Error opening data file /usr/share/tessdata/eng.traineddata' >&2; exit 1"),
+    );
+    let mut server = start_with_tools(&fake, &tools, "/usr/bin");
+
+    let response = server.call_tool("find_text_on_screen", json!({"target":"Save"}));
+
+    let message = error_message(&response);
+    assert!(message.contains("tesseract-data-eng"), "{message}");
+    assert!(message.contains("tesseract-ocr-eng"), "{message}");
+}
+
+#[test]
+fn concurrent_ocr_calls_do_not_trample_each_other() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let tools = fake_tools_directory(Some(&grim_that_captures_the_fixture()), None);
+    let search_path = "/usr/bin";
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let socket = fake.path.clone();
+        let tools = tools.clone();
+        handles.push(std::thread::spawn(move || {
+            let path = format!("{}:{search_path}", tools.display());
+            let mut server =
+                McpProcess::start_with_environment(&socket, &[], &[("PATH", path.as_ref())]);
+            text_content(&server.call_tool("screenshot_with_ocr", json!({})))
+        }));
+    }
+    for handle in handles {
+        assert!(handle.join().expect("ocr thread").contains("Cancel"));
     }
 }

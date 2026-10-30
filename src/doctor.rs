@@ -322,7 +322,7 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn is_on_path(program: &str) -> bool {
+pub fn is_on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|search_path| {
             std::env::split_paths(&search_path)

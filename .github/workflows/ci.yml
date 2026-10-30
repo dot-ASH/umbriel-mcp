@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OCR engine for the OCR tests
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo build --locked
+      - run: cargo test --locked
+
+  static:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build static binary
+        env:
+          RUSTFLAGS: -C linker=rust-lld -C linker-flavor=ld.lld
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Verify the binary is static
+        run: |
+          binary=target/${{ matrix.target }}/release/umbriel-mcp
+          file "$binary" | tee /dev/stderr | grep -E "statically linked|static-pie linked"
+      - name: Complete an MCP handshake
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: scripts/handshake-smoke.sh target/${{ matrix.target }}/release/umbriel-mcp

@@ -85,14 +85,13 @@ impl Dispatch<wl_output::WlOutput, ()> for ProbeState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            if let Some(entry) = state
+        if let wl_output::Event::Name { name } = event
+            && let Some(entry) = state
                 .outputs
                 .iter_mut()
                 .find(|entry| entry.proxy.id() == output.id())
-            {
-                entry.name = Some(name);
-            }
+        {
+            entry.name = Some(name);
         }
     }
 }
@@ -522,10 +521,10 @@ fn wait_for_position(
             .dispatch_pending(state)
             .expect("dispatch pointer events");
         let observed = *state.last_global_position.lock().unwrap();
-        if let Some(position) = observed {
-            if position == expected || Instant::now() >= deadline {
-                return position;
-            }
+        if let Some(position) = observed
+            && (position == expected || Instant::now() >= deadline)
+        {
+            return position;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
@@ -539,10 +538,10 @@ fn wait_for_position(
             tv_nsec: i64::from(remaining.subsec_nanos()),
         };
         poll(&mut descriptors, Some(&timeout)).expect("poll pointer events");
-        if descriptors[0].revents().contains(PollFlags::IN) {
-            if let Some(read_guard) = queue.prepare_read() {
-                read_guard.read().expect("read pointer events");
-            }
+        if descriptors[0].revents().contains(PollFlags::IN)
+            && let Some(read_guard) = queue.prepare_read()
+        {
+            read_guard.read().expect("read pointer events");
         }
     }
 }

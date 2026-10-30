@@ -1,5 +1,7 @@
 # umbriel-mcp
 
+mcp-name: io.github.dot-ash/umbriel-mcp
+
 An MCP server for the [Umbriel](https://docs.noctalia.dev/umbriel/) Wayland compositor.
 
 Exposes Umbriel to MCP clients: list and control windows, workspaces and outputs, drive
@@ -7,58 +9,100 @@ the pointer and keyboard, capture the screen with optional OCR, and read or writ
 clipboard.
 
 Compositor state and actions go straight to Umbriel's IPC socket rather than shelling out
-to the CLI, so inspection costs one round trip and no process spawn. Input, screen
-capture, OCR, and clipboard delegate to the usual Wayland-generic helpers.
+to the CLI, so inspection costs one round trip and no process spawn. Pointer, keyboard, and
+clipboard use Wayland protocols directly. Only screen capture and OCR call external programs.
 
-## Links
+## Read this before installing
 
-- Source: <https://github.com/dot-ASH/umbriel-mcp>
-- MCP Registry name: `mcp-name: io.github.dot-ash/umbriel-mcp`
+**Full access means full control of your desktop.** In the default `full` profile an agent
+connected to this server can launch arbitrary commands, type and click anywhere, read and
+overwrite your clipboard, and see your screen. Anything on screen or in the clipboard is
+visible to the model. Use the [profiles](#profiles) to grant less.
+
+This is a best-effort personal project that tracks an actively evolving compositor. Expect
+0.x behavior changes, and expect it to break when Umbriel changes. There is no support
+promise beyond what I can do in my spare time.
+
+## Compatibility
+
+Support follows Umbriel's own availability: if Umbriel runs on your system, this server
+should. Umbriel is packaged for Arch Linux (`umbriel-git`); on Ubuntu, 26.04 and newer is
+the supported path. Follow [Umbriel's installation page](https://docs.noctalia.dev/umbriel/)
+for your distribution.
+
+**Warning for Arch users:** the AUR package named `umbriel` is a placeholder and is not
+the compositor. Do not install it; the compositor is `umbriel-git`.
 
 ## Install
 
-From crates.io:
+Pick one. All three give you an `umbriel-mcp` executable.
+
+**Prebuilt binary (x86_64 and aarch64 Linux).** Static binaries with no runtime
+libraries, attached to each [GitHub release](https://github.com/dot-ASH/umbriel-mcp/releases):
 
 ```sh
-cargo install umbriel-mcp
+arch=$(uname -m)   # x86_64 or aarch64
+tag=v0.1.0
+curl -LO "https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag/umbriel-mcp-$tag-$arch-linux.tar.gz"
+curl -LO "https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "umbriel-mcp-$tag-$arch-linux.tar.gz"
+install -Dm755 "umbriel-mcp-$tag-$arch-linux/umbriel-mcp" ~/.local/bin/umbriel-mcp
 ```
 
-That puts `umbriel-mcp` in `~/.cargo/bin`. From source instead:
+**Arch Linux (AUR):** `umbriel-mcp-bin` installs the same release binary without compiling.
 
 ```sh
-git clone https://github.com/dot-ASH/umbriel-mcp
-cd umbriel-mcp
-cargo build --release
-install -Dm755 target/release/umbriel-mcp ~/.local/bin/umbriel-mcp
+yay -S umbriel-mcp-bin
 ```
+
+**crates.io** (needs Rust 1.89 or newer):
+
+```sh
+cargo install umbriel-mcp --locked
+```
+
+That puts `umbriel-mcp` in `~/.cargo/bin`.
 
 ## Requirements
 
-| Tool | Used for | Arch package |
-|---|---|---|
-| Umbriel | compositor IPC | `umbriel-git` |
-| `grim` | screen capture | `grim` |
-| `tesseract` + English data | OCR tools only | `tesseract`, `tesseract-data-eng` |
+Pointer, keyboard, and clipboard need nothing beyond a running Umbriel session. These
+external programs are needed only for the screen tools:
 
-Pointer and keyboard input use Umbriel's Wayland virtual-pointer and virtual-keyboard
-protocols directly, so no input daemon, device permissions, or privileged group are needed.
-Clipboard access also talks to the compositor directly (the data-control protocol). Only
-the screen-capture and OCR tools depend on the helpers above.
+| Tool | Used for | Arch | Debian/Ubuntu | Fedora |
+|---|---|---|---|---|
+| `grim` | `screenshot`, OCR tools | `grim` | `grim` | `grim` |
+| `tesseract` | `screenshot_with_ocr`, `find_text_on_screen`, `click_text` | `tesseract` | `tesseract-ocr` | `tesseract` |
+| English OCR data | same | `tesseract-data-eng` | `tesseract-ocr-eng` | `tesseract-langpack-eng` |
+
+The tools are always listed; a call that needs a missing program fails with an error naming
+it. Run `umbriel-mcp doctor` (below) to find out what is missing.
 
 The socket is found through `UMBRIEL_SOCKET`, falling back to
 `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock`.
 
-## Configure
+## Register with your harness
 
-Register it as a stdio server with your MCP client:
+```sh
+umbriel-mcp install pi            # also: claude-code, vscode
+umbriel-mcp install opencode      # also: cursor, zed (prints config to paste)
+umbriel-mcp install claude-code --profile no-exec
+```
+
+For `pi`, `claude-code`, and `vscode` this runs the harness's own CLI (`pi mcp add`,
+`claude mcp add`, `code --add-mcp`). For `opencode`, `cursor`, and `zed` it prints the
+configuration to paste; it never reads or edits your config files. A profile is added to
+the registration only if you pass `--profile`, so the default stays `full`. The pi
+registration uses direct exposure so the tools are offered to the model without codemode
+discovery. The Zed snippet keeps `"args": []` because Zed rejects its whole settings file
+if it is missing.
+
+Any other MCP client can use the plain stdio form:
 
 ```json
 {
   "mcpServers": {
-    "umbriel": {
-      "type": "stdio",
-      "command": "umbriel-mcp"
-    }
+    "umbriel": { "command": "umbriel-mcp", "args": [] }
   }
 }
 ```
@@ -115,8 +159,9 @@ position or a name and accept an optional `/output` suffix, which the `workspace
 
 Screenshots are downscaled to 1024px wide by default and returned as JPEG alongside a
 coordinate-mapping note, so screen coordinates can be recovered from image coordinates.
-`find_text_on_screen` and `click_text` apply that mapping themselves and report absolute
-screen coordinates.
+OCR is different: it always runs on the full-resolution capture, because recognising text in
+the downscaled preview finds nothing. `find_text_on_screen` and `click_text` therefore report
+absolute screen coordinates directly, and match multi-word phrases such as `Open File`.
 
 ## License
 

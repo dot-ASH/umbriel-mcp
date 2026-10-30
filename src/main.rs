@@ -3,6 +3,7 @@ mod input;
 mod ipc;
 mod keyboard;
 mod profile;
+mod register;
 mod screen;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
@@ -436,7 +437,7 @@ impl UmbrielServer {
             request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH),
         )
         .map_err(failed)?;
-        let recognised = screen::read_text(&shot.jpeg).map_err(failed)?;
+        let recognised = screen::read_text(&shot.native_png).map_err(failed)?;
         Ok(CallToolResult::success(vec![
             ContentBlock::image(BASE64_STANDARD.encode(&shot.jpeg), "image/jpeg"),
             ContentBlock::text(format!(
@@ -455,8 +456,7 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         let shot = screen::capture(request.output.as_deref(), None, screen::DEFAULT_MAX_WIDTH)
             .map_err(failed)?;
-        let factor = shot.native_width as f64 / shot.encoded_width.max(1) as f64;
-        let found = screen::find_text(&shot.jpeg, &request.target).map_err(failed)?;
+        let found = screen::find_text(&shot.native_png, &request.target).map_err(failed)?;
         if found.is_empty() {
             return Ok(format!("no match for {:?} on screen", request.target));
         }
@@ -467,8 +467,8 @@ impl UmbrielServer {
                     "{:?} confidence {:.0} at screen ({}, {})",
                     hit.text,
                     hit.confidence,
-                    (hit.center_x as f64 * factor).round() as i64 + shot.origin_x,
-                    (hit.center_y as f64 * factor).round() as i64 + shot.origin_y
+                    i64::from(hit.center_x) + shot.origin_x,
+                    i64::from(hit.center_y) + shot.origin_y
                 )
             })
             .collect();
@@ -482,14 +482,13 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         let shot = screen::capture(request.output.as_deref(), None, screen::DEFAULT_MAX_WIDTH)
             .map_err(failed)?;
-        let factor = shot.native_width as f64 / shot.encoded_width.max(1) as f64;
-        let found = screen::find_text(&shot.jpeg, &request.target).map_err(failed)?;
+        let found = screen::find_text(&shot.native_png, &request.target).map_err(failed)?;
         let best = found.first().ok_or_else(|| {
             ErrorData::internal_error(format!("no match for {:?}", request.target), None)
         })?;
 
-        let x = (best.center_x as f64 * factor).round() as i64 + shot.origin_x;
-        let y = (best.center_y as f64 * factor).round() as i64 + shot.origin_y;
+        let x = i64::from(best.center_x) + shot.origin_x;
+        let y = i64::from(best.center_y) + shot.origin_y;
         input::move_pointer(x as i32, y as i32).map_err(failed)?;
         input::click("left", false).map_err(failed)?;
         Ok(format!("clicked {:?} at ({x}, {y})", best.text))
@@ -546,13 +545,22 @@ struct Cli {
 enum Command {
     /// Check that Umbriel, its input protocols, screen capture, and OCR are ready
     Doctor,
+    /// Register this server with an AI coding harness, or print the config to paste
+    Install {
+        harness: register::Harness,
+        /// Restrict the registered server to this profile (default: no restriction)
+        #[arg(long, value_enum)]
+        profile: Option<Profile>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
-    if let Some(Command::Doctor) = cli.command {
-        return Ok(doctor::run());
+    match cli.command {
+        Some(Command::Doctor) => return Ok(doctor::run()),
+        Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
+        None => {}
     }
     let service = UmbrielServer {
         profile: cli.profile,
