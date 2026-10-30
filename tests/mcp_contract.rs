@@ -971,6 +971,14 @@ Workspaces
 HELP
   ;;
   "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true}]}' ;;
+  "config validate -c "*)
+    if grep -q "no-such-action" "$4"; then
+      printf '12:00:00.000 [\033[33mWRN\033[0m] [config] %s:3:1: ignoring keybind\n' "$4"
+      echo "warning: $4:3:1: ignoring keybind 'Mod+X' (unknown action 'no-such-action')"
+      echo "configuration invalid"
+      exit 1
+    fi
+    echo "config: ok ($4)" ;;
   "config validate") echo "config: ok (fake)" ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -993,13 +1001,17 @@ fn compositor_state_replies() -> HashMap<String, Value> {
 }
 
 fn start_read_only_with_umbriel_cli(home: &std::path::Path) -> (FakeUmbriel, McpProcess) {
+    start_with_umbriel_cli(home, "read-only")
+}
+
+fn start_with_umbriel_cli(home: &std::path::Path, profile: &str) -> (FakeUmbriel, McpProcess) {
     let fake = FakeUmbriel::start(compositor_state_replies());
     let tools = fake_tools_directory(None, None);
     fake_umbriel_cli(&tools);
     let path = format!("{}:/usr/bin", tools.display());
     let server = McpProcess::start_with_environment(
         &fake.path,
-        &["--profile", "read-only"],
+        &["--profile", profile],
         &[
             ("PATH", path.as_ref()),
             ("HOME", home.as_os_str()),
@@ -1116,4 +1128,285 @@ fn the_instructions_point_umbriel_questions_at_the_knowledge_tools() {
     ] {
         assert!(instructions.contains(tool), "{instructions}");
     }
+}
+
+const KEYBIND_CONFIG: &str = "# my config\n[general]\nautostart = []\n\n[keybinds]\n\"Mod+T\" = { action = \"spawn:kitty\", repeat = false }\n\"Mod+Q\" = \"window-close\"\n\n[layout]\ngap = 4\n";
+
+fn config_file(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/umbriel/config.toml")
+}
+
+fn files_beside_config(home: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(home.join(".config/umbriel"))
+        .expect("config dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn set_keybind_adds_a_validated_binding_and_backs_up_the_old_config() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-toggle-fullscreen"}),
+    );
+
+    let report = text_content(&response);
+    let config = std::fs::read_to_string(config_file(&home)).unwrap();
+    assert!(
+        config.contains("\"Mod+F\" = \"window-toggle-fullscreen\""),
+        "{config}"
+    );
+    assert!(config.starts_with("# my config"), "{config}");
+    assert!(
+        report.contains("+ \"Mod+F\" = \"window-toggle-fullscreen\""),
+        "{report}"
+    );
+    let backups: Vec<String> = files_beside_config(&home)
+        .into_iter()
+        .filter(|name| name.starts_with("config.toml.bak-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "{:?}", files_beside_config(&home));
+    let backup = std::fs::read_to_string(home.join(".config/umbriel").join(&backups[0])).unwrap();
+    assert_eq!(backup, KEYBIND_CONFIG);
+    assert!(report.contains(&backups[0]), "{report}");
+}
+
+#[test]
+fn rebinding_reports_what_the_chord_did_before() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let report = text_content(&server.call_tool(
+        "set_keybind",
+        json!({"chord":"mod+q","action":"window-kill"}),
+    ));
+
+    assert!(
+        report.contains("Bound Mod+Q to window-kill (was window-close)"),
+        "{report}"
+    );
+    let config = std::fs::read_to_string(config_file(&home)).unwrap();
+    assert_eq!(config.matches("Mod+Q").count(), 1, "{config}");
+}
+
+#[test]
+fn a_binding_umbriel_rejects_is_never_written() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+X","action":"no-such-action"}),
+    );
+
+    let message = error_message(&response);
+    assert!(message.contains("rejected the change"), "{message}");
+    assert!(
+        message.contains("unknown action 'no-such-action'"),
+        "{message}"
+    );
+    assert!(
+        !message.contains('\u{1b}'),
+        "terminal colour codes leaked: {message:?}"
+    );
+    assert!(
+        !message.contains(".umbriel-mcp-"),
+        "temporary file name leaked: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_file(&home)).unwrap(),
+        KEYBIND_CONFIG
+    );
+    assert_eq!(files_beside_config(&home), vec!["config.toml"]);
+}
+
+#[test]
+fn remove_keybind_drops_the_binding_and_reports_it() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let report = text_content(&server.call_tool("remove_keybind", json!({"chord":"Mod+T"})));
+    let missing = server.call_tool("remove_keybind", json!({"chord":"Mod+Z"}));
+
+    assert!(
+        report.contains("Removed the binding for Mod+T (was spawn:kitty)"),
+        "{report}"
+    );
+    assert!(
+        !std::fs::read_to_string(config_file(&home))
+            .unwrap()
+            .contains("Mod+T")
+    );
+    assert!(
+        error_message(&missing).contains("Mod+Z is not bound"),
+        "{missing}"
+    );
+}
+
+#[test]
+fn no_exec_may_bind_ordinary_actions_but_not_programs() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "no-exec");
+
+    let ordinary = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-toggle-fullscreen"}),
+    );
+    let program = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+B","action":"SPAWN:sh -c id"}),
+    );
+
+    assert!(ordinary.get("result").is_some(), "{ordinary}");
+    assert_refused_by_profile(&program, "no-exec");
+    assert!(
+        !std::fs::read_to_string(config_file(&home))
+            .unwrap()
+            .contains("Mod+B")
+    );
+}
+
+#[test]
+fn read_only_may_not_change_keybinds() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "read-only");
+
+    let set = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-close"}),
+    );
+    let remove = server.call_tool("remove_keybind", json!({"chord":"Mod+T"}));
+
+    assert_refused_by_profile(&set, "read-only");
+    assert_refused_by_profile(&remove, "read-only");
+    assert_eq!(
+        std::fs::read_to_string(config_file(&home)).unwrap(),
+        KEYBIND_CONFIG
+    );
+}
+
+#[test]
+fn a_symlinked_config_stays_a_symlink_and_its_target_is_edited() {
+    let home = home_with_config("");
+    let dotfiles = home.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::write(dotfiles.join("umbriel.toml"), KEYBIND_CONFIG).unwrap();
+    std::fs::remove_file(config_file(&home)).unwrap();
+    std::os::unix::fs::symlink(dotfiles.join("umbriel.toml"), config_file(&home)).unwrap();
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-close"}),
+    );
+
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(
+        std::fs::symlink_metadata(config_file(&home))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::read_to_string(dotfiles.join("umbriel.toml"))
+            .unwrap()
+            .contains("Mod+F")
+    );
+}
+
+#[test]
+fn a_chord_owned_by_an_included_file_is_left_alone() {
+    let home = home_with_config(
+        "[include]\nfiles = [\"binds.toml\"]\n\n[keybinds]\n\"Mod+Q\" = \"window-close\"\n",
+    );
+    std::fs::write(
+        home.join(".config/umbriel/binds.toml"),
+        "[keybinds]\n\"Mod+T\" = \"spawn:kitty\"\n",
+    )
+    .unwrap();
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+T","action":"spawn:foot"}),
+    );
+
+    let message = error_message(&response);
+    assert!(message.contains("binds.toml"), "{message}");
+    assert!(
+        !std::fs::read_to_string(config_file(&home))
+            .unwrap()
+            .contains("Mod+T")
+    );
+}
+
+#[test]
+fn without_a_user_config_nothing_is_created_and_the_user_is_told_what_to_do() {
+    let home = fake_tools_directory(None, None);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-close"}),
+    );
+
+    let message = error_message(&response);
+    assert!(message.contains("no user config"), "{message}");
+    assert!(
+        message.contains("/usr/share/umbriel/config.toml"),
+        "{message}"
+    );
+    assert!(!config_file(&home).exists());
+}
+
+#[test]
+fn quick_successive_edits_each_keep_their_own_backup() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
+
+    for (chord, action) in [
+        ("Mod+F", "window-close"),
+        ("Mod+G", "window-kill"),
+        ("Mod+H", "window-close"),
+    ] {
+        let response = server.call_tool("set_keybind", json!({"chord":chord,"action":action}));
+        assert!(response.get("result").is_some(), "{response}");
+    }
+
+    let directory = home.join(".config/umbriel");
+    let backups: Vec<String> = files_beside_config(&home)
+        .into_iter()
+        .filter(|name| name.starts_with("config.toml.bak-"))
+        .collect();
+    assert_eq!(backups.len(), 3, "{backups:?}");
+    let contents: Vec<String> = backups
+        .iter()
+        .map(|name| std::fs::read_to_string(directory.join(name)).unwrap())
+        .collect();
+    assert!(
+        contents.contains(&KEYBIND_CONFIG.to_owned()),
+        "the original config must survive"
+    );
+}
+
+#[test]
+fn the_server_reports_the_crate_version() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let initialized = server.request(
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"v","version":"1"}}),
+    );
+
+    assert_eq!(
+        initialized["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 }

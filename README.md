@@ -82,7 +82,7 @@ umbriel-mcp doctor
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.1.0
+   tag=v0.2.0
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -229,6 +229,15 @@ schema), `read_config` (your config or one section such as `keybinds`, plus vali
 read from the installed `umbriel` command and your config, so they match the version you run.
 The schema has no prose descriptions; explanations live in the
 [Umbriel documentation](https://docs.noctalia.dev/umbriel/).
+
+**Changing keybinds** — `set_keybind` and `remove_keybind` edit the `[keybinds]` table of your
+`~/.config/umbriel/config.toml`. Each edit is checked with `umbriel config validate` before the
+file is replaced, so a rejected action or chord never goes live. The previous config is saved
+next to it as `config.toml.bak-<time>`, only the changed line differs (comments and formatting
+are kept), a symlinked config stays a symlink, and a chord bound in an `[include]` file is left
+alone. Umbriel applies the change immediately. `read-only` refuses edits, and `no-exec` refuses
+any binding to a `spawn:` action, because a keybind that starts a program would let an agent run
+commands later through you. Backups are not cleaned up automatically.
 
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
 `click_text`, `clipboard_read`, `clipboard_write`. With a `window_id`, `screenshot` and

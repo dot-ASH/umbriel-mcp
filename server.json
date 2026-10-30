@@ -3,7 +3,7 @@
   "name": "io.github.dot-ash/umbriel-mcp",
   "title": "Umbriel",
   "description": "Control the Umbriel Wayland compositor: windows, workspaces, input, screenshots, clipboard.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/dot-ASH/umbriel-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "cargo",
       "identifier": "umbriel-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       }

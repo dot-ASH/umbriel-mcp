@@ -1,4 +1,5 @@
 mod compositor;
+mod config_edit;
 mod doctor;
 mod input;
 mod ipc;
@@ -185,6 +186,22 @@ struct OptionQuery {
 struct ConfigSection {
     /// Only return this section and its subsections, such as "keybinds", "layout" or "window_rule"
     section: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct KeybindRequest {
+    /// Key chord as Umbriel writes it, such as "Mod+F" or "Mod+Shift+Return"
+    chord: String,
+    /// Umbriel action, as listed by list_actions, such as "window-toggle-fullscreen" or "spawn:kitty"
+    action: String,
+    /// Repeat the action while the keys are held; omit to keep Umbriel's default
+    repeat: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct KeybindChord {
+    /// Key chord to unbind, such as "Mod+F"
+    chord: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -375,7 +392,7 @@ impl UmbrielServer {
     #[tool(description = "Run any raw umbriel action, for anything the other tools do not cover.")]
     fn run_action(&self, Parameters(request): Parameters<RawAction>) -> Result<String, ErrorData> {
         self.profile
-            .permit_action(&request.action)
+            .permit_action("run_action", &request.action)
             .map_err(refused)?;
         acted(request.action)
     }
@@ -566,6 +583,29 @@ impl UmbrielServer {
         compositor::read_config(request.section.as_deref()).map_err(failed)
     }
 
+    #[tool(
+        description = "Bind a key chord to an Umbriel action in the user's config, replacing any existing binding for it. The edited config is checked with `umbriel config validate` before saving, the previous config is backed up, and Umbriel applies it immediately. Use list_actions for valid actions."
+    )]
+    fn set_keybind(
+        &self,
+        Parameters(request): Parameters<KeybindRequest>,
+    ) -> Result<String, ErrorData> {
+        self.profile
+            .permit_action("set_keybind", &request.action)
+            .map_err(refused)?;
+        config_edit::set_keybind(&request.chord, &request.action, request.repeat).map_err(failed)
+    }
+
+    #[tool(
+        description = "Remove a key chord's binding from the user's Umbriel config. The previous config is backed up and Umbriel applies the change immediately."
+    )]
+    fn remove_keybind(
+        &self,
+        Parameters(request): Parameters<KeybindChord>,
+    ) -> Result<String, ErrorData> {
+        config_edit::remove_keybind(&request.chord).map_err(failed)
+    }
+
     #[tool(description = "Read the current clipboard contents.")]
     fn clipboard_read(&self) -> Result<String, ErrorData> {
         input::clipboard_read().map_err(failed)
@@ -586,8 +626,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    version = "0.1.0",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change keybinds with set_keybind and remove_keybind rather than editing the config file directly."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(

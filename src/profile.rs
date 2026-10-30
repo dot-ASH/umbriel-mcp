@@ -72,6 +72,8 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("key_press", Access::Control),
     ("click_text", Access::Control),
     ("clipboard_write", Access::Control),
+    ("set_keybind", Access::Control),
+    ("remove_keybind", Access::Control),
     ("launch_app", Access::Execute),
 ];
 
@@ -104,10 +106,10 @@ impl Profile {
         ))
     }
 
-    pub fn permit_action(self, action: &str) -> Result<(), String> {
+    pub fn permit_action(self, tool: &str, action: &str) -> Result<(), String> {
         if self < Profile::Full && is_spawn_action(action) {
             return Err(format!(
-                "`run_action` cannot run `{}` in the `{self}` profile: actions that start \
+                "`{tool}` cannot use `{}` in the `{self}` profile: actions that start \
                  programs need the `full` profile. Restart umbriel-mcp with `--profile full` \
                  to allow it.",
                 action.trim()
