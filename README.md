@@ -222,8 +222,18 @@ type into a focused terminal can still run commands through the input tools.
 **Input** — `mouse_move`, `mouse_click`, `mouse_scroll`, `mouse_drag`, `type_text`,
 `key_press`
 
+**About Umbriel itself** — `umbriel_info` (version, keyboard layouts, submap, color and
+tearing state), `list_actions` (every action `run_action` and keybinds accept, filterable),
+`config_options` (exact config keys with types, defaults and allowed values, from Umbriel's own
+schema), `read_config` (your config or one section such as `keybinds`, plus validation). These
+read from the installed `umbriel` command and your config, so they match the version you run.
+The schema has no prose descriptions; explanations live in the
+[Umbriel documentation](https://docs.noctalia.dev/umbriel/).
+
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
-`click_text`, `clipboard_read`, `clipboard_write`
+`click_text`, `clipboard_read`, `clipboard_write`. With a `window_id`, `screenshot` and
+`screenshot_with_ocr` capture that window even on a hidden workspace, without switching to it
+(needs `grim` 1.5 or newer; older `grim` can only capture windows that are on screen).
 
 `key_press` takes chords such as `ctrl+shift+Tab`, `super+q`, `F5` or `alt+Left`; an uppercase
 letter (`ctrl+A`) implies Shift. `type_text` accepts any Unicode text, with `\n` typed as Return

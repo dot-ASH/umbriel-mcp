@@ -1,3 +1,4 @@
+mod compositor;
 mod doctor;
 mod input;
 mod ipc;
@@ -165,6 +166,25 @@ struct TextSearchRequest {
     target: String,
     /// Restrict the search to this output
     output: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ActionFilter {
+    /// Only list actions whose name, description or group contains this text, such as "workspace"
+    filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OptionQuery {
+    /// Words that must all appear in the option path, such as "gap" or "blur enabled"; omit for a
+    /// per-section summary
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConfigSection {
+    /// Only return this section and its subsections, such as "keybinds", "layout" or "window_rule"
+    section: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -509,6 +529,43 @@ impl UmbrielServer {
         Ok(format!("clicked {:?} at ({x}, {y})", best.text))
     }
 
+    #[tool(
+        description = "Describe the Umbriel compositor itself: installed version, keyboard layouts, active keybind submap, color management and tearing state."
+    )]
+    fn umbriel_info(&self) -> Result<String, ErrorData> {
+        as_pretty_json(compositor::info())
+    }
+
+    #[tool(
+        description = "List the actions Umbriel can perform (what run_action and keybinds accept), with descriptions. Filter by text such as \"workspace\" or \"focus\"."
+    )]
+    fn list_actions(
+        &self,
+        Parameters(request): Parameters<ActionFilter>,
+    ) -> Result<String, ErrorData> {
+        compositor::list_actions(request.filter.as_deref()).map_err(failed)
+    }
+
+    #[tool(
+        description = "Search Umbriel's configuration options by path, such as \"gap\" or \"blur\", returning exact key names, types, defaults, ranges and allowed values. Use it before suggesting config changes."
+    )]
+    fn config_options(
+        &self,
+        Parameters(request): Parameters<OptionQuery>,
+    ) -> Result<String, ErrorData> {
+        as_pretty_json(compositor::config_options(request.query.as_deref()).map_err(failed)?)
+    }
+
+    #[tool(
+        description = "Read the user's Umbriel config, or one section such as \"keybinds\", together with whether it validates. Use it for questions like what a key does or how a setting is configured."
+    )]
+    fn read_config(
+        &self,
+        Parameters(request): Parameters<ConfigSection>,
+    ) -> Result<String, ErrorData> {
+        compositor::read_config(request.section.as_deref()).map_err(failed)
+    }
+
     #[tool(description = "Read the current clipboard contents.")]
     fn clipboard_read(&self) -> Result<String, ErrorData> {
         input::clipboard_read().map_err(failed)
@@ -530,7 +587,7 @@ impl UmbrielServer {
 #[tool_handler(
     name = "umbriel-mcp",
     version = "0.1.0",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(

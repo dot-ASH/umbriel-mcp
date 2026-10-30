@@ -951,3 +951,169 @@ fn ocr_can_read_a_window_on_a_hidden_workspace() {
     );
     assert!(grim_arguments(&record).contains(&"-T".to_owned()));
 }
+
+fn fake_umbriel_cli(tools: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = r#"#!/bin/sh
+case "$*" in
+  "--version") echo "umbriel 9.9.9 (fake)" ;;
+  "msg --help") cat <<'HELP'
+Usage: umbriel msg <action> [args...]
+
+Available actions, grouped as the cheatsheet groups them:
+
+Apps
+  spawn:<cmd>  Run a command with a launch activation token
+
+Workspaces
+  workspace-switch:<selector>  Switch to a workspace
+  workspace-next               Switch to the next workspace
+HELP
+  ;;
+  "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true}]}' ;;
+  "config validate") echo "config: ok (fake)" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#;
+    let path = tools.join("umbriel");
+    std::fs::write(&path, script).expect("write fake umbriel");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+fn compositor_state_replies() -> HashMap<String, Value> {
+    HashMap::from([
+        (
+            "keyboard-layouts".to_string(),
+            json!({"ok": {"current_index": 0, "names": ["English (US)", "Bangla"]}}),
+        ),
+        ("submap".to_string(), json!({"ok": null})),
+        ("color".to_string(), json!({"ok": {"color_manager": true}})),
+        ("tearing".to_string(), json!({"ok": {"outputs": []}})),
+    ])
+}
+
+fn start_read_only_with_umbriel_cli(home: &std::path::Path) -> (FakeUmbriel, McpProcess) {
+    let fake = FakeUmbriel::start(compositor_state_replies());
+    let tools = fake_tools_directory(None, None);
+    fake_umbriel_cli(&tools);
+    let path = format!("{}:/usr/bin", tools.display());
+    let server = McpProcess::start_with_environment(
+        &fake.path,
+        &["--profile", "read-only"],
+        &[
+            ("PATH", path.as_ref()),
+            ("HOME", home.as_os_str()),
+            ("XDG_CONFIG_HOME", std::ffi::OsStr::new("")),
+        ],
+    );
+    (fake, server)
+}
+
+fn home_with_config(config: &str) -> std::path::PathBuf {
+    let home = fake_tools_directory(None, None);
+    let directory = home.join(".config/umbriel");
+    std::fs::create_dir_all(&directory).expect("create config dir");
+    std::fs::write(directory.join("config.toml"), config).expect("write config");
+    home
+}
+
+#[test]
+fn umbriel_info_reports_version_and_live_state() {
+    let home = home_with_config("[general]\n");
+    let (_fake, mut server) = start_read_only_with_umbriel_cli(&home);
+
+    let info: Value =
+        serde_json::from_str(&text_content(&server.call_tool("umbriel_info", json!({})))).unwrap();
+
+    assert_eq!(info["installed_version"], "umbriel 9.9.9 (fake)");
+    assert_eq!(info["keyboard_layouts"]["names"][1], "Bangla");
+    assert!(
+        info["reference"]
+            .as_str()
+            .unwrap()
+            .contains("docs.noctalia.dev")
+    );
+}
+
+#[test]
+fn list_actions_shows_runnable_actions_and_filters_them() {
+    let home = home_with_config("[general]\n");
+    let (_fake, mut server) = start_read_only_with_umbriel_cli(&home);
+
+    let all = text_content(&server.call_tool("list_actions", json!({})));
+    let workspace = text_content(&server.call_tool("list_actions", json!({"filter":"workspace"})));
+    let none = text_content(&server.call_tool("list_actions", json!({"filter":"teleport"})));
+
+    assert!(all.contains("3 of 3 actions"), "{all}");
+    assert!(all.contains("spawn:<cmd>"), "{all}");
+    assert!(workspace.contains("2 of 3 actions"), "{workspace}");
+    assert!(!workspace.contains("spawn"), "{workspace}");
+    assert!(none.contains("no action matches"), "{none}");
+}
+
+#[test]
+fn config_options_returns_exact_keys_with_defaults() {
+    let home = home_with_config("[general]\n");
+    let (_fake, mut server) = start_read_only_with_umbriel_cli(&home);
+
+    let found: Value = serde_json::from_str(&text_content(
+        &server.call_tool("config_options", json!({"query":"gap"})),
+    ))
+    .unwrap();
+
+    assert_eq!(found["options"][0]["path"], "layout.gap");
+    assert_eq!(found["options"][0]["default"], 8);
+    assert_eq!(found["total_matches"], 1);
+}
+
+#[test]
+fn read_config_returns_a_section_with_its_validation() {
+    let home = home_with_config(
+        "[general]\nautostart = []\n\n[keybinds]\n\"Mod+T\" = { action = \"spawn:kitty\" }\n\n[layout]\ngap = 4\n",
+    );
+    let (_fake, mut server) = start_read_only_with_umbriel_cli(&home);
+
+    let keybinds = text_content(&server.call_tool("read_config", json!({"section":"keybinds"})));
+    let missing = server.call_tool("read_config", json!({"section":"hot_corners"}));
+
+    assert!(
+        keybinds.contains("\"Mod+T\" = { action = \"spawn:kitty\" }"),
+        "{keybinds}"
+    );
+    assert!(!keybinds.contains("gap = 4"), "{keybinds}");
+    assert!(
+        keybinds.contains("Validation: config: ok (fake)"),
+        "{keybinds}"
+    );
+    assert!(
+        keybinds.contains(".config/umbriel/config.toml"),
+        "{keybinds}"
+    );
+    assert!(
+        error_message(&missing).contains("no [hot_corners] section"),
+        "{missing}"
+    );
+}
+
+#[test]
+fn the_instructions_point_umbriel_questions_at_the_knowledge_tools() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let initialized = server.request(
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"i","version":"1"}}),
+    );
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default();
+
+    for tool in [
+        "umbriel_info",
+        "list_actions",
+        "config_options",
+        "read_config",
+    ] {
+        assert!(instructions.contains(tool), "{instructions}");
+    }
+}
