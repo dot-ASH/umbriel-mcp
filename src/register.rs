@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 
 const SERVER_NAME: &str = "umbriel";
 const SERVER_BINARY: &str = "umbriel-mcp";
+pub const SERVER_SUMMARY: &str = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Harness {
@@ -60,7 +61,16 @@ pub fn plan(harness: Harness, profile: Option<Profile>, server_command: &str) ->
     match harness {
         Harness::Pi => Registration::Delegate {
             program: "pi",
-            arguments: words(&["mcp", "add", SERVER_NAME, "--exposure", "direct", "--"]),
+            arguments: words(&[
+                "mcp",
+                "add",
+                SERVER_NAME,
+                "--exposure",
+                "direct",
+                "--description",
+                SERVER_SUMMARY,
+                "--",
+            ]),
             follow_up: "Start a new pi session; the tools are exposed directly to the model.",
         },
         Harness::ClaudeCode => Registration::Delegate {
@@ -189,7 +199,7 @@ pub fn run(harness: Harness, profile: Option<Profile>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Harness, Registration, plan};
+    use super::{Harness, Registration, SERVER_SUMMARY, plan};
     use crate::profile::Profile;
     use serde_json::{Value, json};
 
@@ -228,10 +238,13 @@ mod tests {
                 "umbriel",
                 "--exposure",
                 "direct",
+                "--description",
+                SERVER_SUMMARY,
                 "--",
                 "umbriel-mcp"
             ])
         );
+        assert!(SERVER_SUMMARY.contains("this desktop"));
     }
 
     #[test]

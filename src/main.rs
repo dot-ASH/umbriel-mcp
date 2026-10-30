@@ -33,6 +33,14 @@ fn acted(action: String) -> Result<String, ErrorData> {
     Ok(format!("ok: {action}"))
 }
 
+fn workspace_matches(window_workspace: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    window_workspace == wanted
+        || window_workspace
+            .rsplit_once(':')
+            .is_some_and(|(_, number_or_name)| number_or_name == wanted)
+}
+
 fn refused(reason: String) -> ErrorData {
     ErrorData::invalid_request(reason, None)
 }
@@ -46,7 +54,8 @@ fn with_optional_target(base: &str, target: &Option<String>) -> String {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WindowFilter {
-    /// Only list windows on this workspace id, such as "HDMI-A-1:2"
+    /// Workspace to list: a number or name such as "4" (that workspace on every monitor),
+    /// or a full id such as "HDMI-A-1:4"
     workspace: Option<String>,
     /// Only list windows on this output, such as "DP-1"
     output: Option<String>,
@@ -177,7 +186,7 @@ struct UmbrielServer {
 #[tool_router]
 impl UmbrielServer {
     #[tool(
-        description = "List open windows with id, app_id, title, geometry, output and workspace."
+        description = "List the windows open on this desktop with id, app_id, title, geometry, monitor and workspace. Use it to answer what is open or what is on workspace 4; pass workspace \"4\" for that workspace on every monitor."
     )]
     fn list_windows(
         &self,
@@ -191,7 +200,7 @@ impl UmbrielServer {
                 filter
                     .workspace
                     .as_ref()
-                    .is_none_or(|wanted| field("workspace") == wanted)
+                    .is_none_or(|wanted| workspace_matches(field("workspace"), wanted))
                     && filter
                         .output
                         .as_ref()
@@ -201,19 +210,21 @@ impl UmbrielServer {
         as_pretty_json(serde_json::Value::Array(kept))
     }
 
-    #[tool(description = "List workspaces with output, index, layout, occupancy and focus state.")]
+    #[tool(
+        description = "List this desktop's workspaces with monitor, index, layout, window count and focus. Each monitor has its own numbered workspaces."
+    )]
     fn list_workspaces(&self) -> Result<String, ErrorData> {
         as_pretty_json(ipc::query("workspaces").map_err(failed)?)
     }
 
     #[tool(
-        description = "List outputs (monitors) with position, modes, scale and active workspace."
+        description = "List this desktop's monitors (outputs) with position, modes, scale and the workspace each one shows."
     )]
     fn list_outputs(&self) -> Result<String, ErrorData> {
         as_pretty_json(ipc::query("outputs").map_err(failed)?)
     }
 
-    #[tool(description = "Get the currently focused window.")]
+    #[tool(description = "Get the window that currently has focus on this desktop.")]
     fn get_active_window(&self) -> Result<String, ErrorData> {
         as_pretty_json(ipc::query("focused-window").map_err(failed)?)
     }
@@ -515,7 +526,7 @@ impl UmbrielServer {
 #[tool_handler(
     name = "umbriel-mcp",
     version = "0.1.0",
-    instructions = "Inspect and control the Umbriel Wayland compositor: windows, workspaces, outputs, pointer and keyboard input, screenshots with OCR, and the clipboard. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(
@@ -575,6 +586,20 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
 mod tests {
     use super::UmbrielServer;
     use crate::profile::TOOL_ACCESS;
+    use crate::register::SERVER_SUMMARY;
+    use rmcp::ServerHandler;
+
+    #[test]
+    fn the_registration_summary_is_the_first_line_of_the_server_instructions() {
+        let instructions = UmbrielServer {
+            profile: crate::profile::Profile::Full,
+        }
+        .get_info()
+        .instructions
+        .expect("server instructions");
+
+        assert_eq!(instructions.lines().next(), Some(SERVER_SUMMARY));
+    }
 
     #[test]
     fn every_advertised_tool_is_explicitly_classified_and_nothing_stale_remains() {

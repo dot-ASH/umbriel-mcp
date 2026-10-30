@@ -72,9 +72,18 @@ fn pi_registration_runs_the_pi_cli_with_direct_exposure() {
     let arguments = recorded(&record);
     assert_eq!(
         &arguments[..6],
-        ["mcp", "add", "umbriel", "--exposure", "direct", "--"]
+        [
+            "mcp",
+            "add",
+            "umbriel",
+            "--exposure",
+            "direct",
+            "--description"
+        ]
     );
-    assert!(arguments[6].ends_with("umbriel-mcp"), "{arguments:?}");
+    assert!(arguments[6].contains("this desktop"), "{arguments:?}");
+    assert_eq!(arguments[7], "--");
+    assert!(arguments[8].ends_with("umbriel-mcp"), "{arguments:?}");
     assert!(!arguments.contains(&"--profile".to_owned()));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Registered umbriel"));
     assert!(

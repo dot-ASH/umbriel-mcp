@@ -724,3 +724,90 @@ fn concurrent_ocr_calls_do_not_trample_each_other() {
         assert!(handle.join().expect("ocr thread").contains("Cancel"));
     }
 }
+
+fn windows_on_two_outputs() -> HashMap<String, Value> {
+    HashMap::from([(
+        "windows".to_string(),
+        json!({
+            "ok": [
+                { "id": "left-4", "title": "Figma", "output": "HDMI-A-1", "workspace": "HDMI-A-1:4" },
+                { "id": "right-4", "title": "notes", "output": "DP-1", "workspace": "DP-1:4" },
+                { "id": "right-1", "title": "shell", "output": "DP-1", "workspace": "DP-1:1" },
+                { "id": "named", "title": "chat", "output": "DP-1", "workspace": "DP-1:web" }
+            ]
+        }),
+    )])
+}
+
+fn listed_window_ids(server: &mut McpProcess, arguments: Value) -> Vec<String> {
+    let response = server.call_tool("list_windows", arguments);
+    let windows: Value =
+        serde_json::from_str(&text_content(&response)).expect("filtered windows JSON");
+    windows
+        .as_array()
+        .expect("filtered windows array")
+        .iter()
+        .filter_map(|window| window["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn a_bare_workspace_number_lists_that_workspace_on_every_output() {
+    let fake = FakeUmbriel::start(windows_on_two_outputs());
+    let mut server = McpProcess::start(&fake.path);
+
+    assert_eq!(
+        listed_window_ids(&mut server, json!({"workspace":"4"})),
+        vec!["left-4", "right-4"]
+    );
+    assert_eq!(
+        listed_window_ids(&mut server, json!({"workspace":"4","output":"DP-1"})),
+        vec!["right-4"]
+    );
+    assert_eq!(
+        listed_window_ids(&mut server, json!({"workspace":"DP-1:4"})),
+        vec!["right-4"]
+    );
+    assert_eq!(
+        listed_window_ids(&mut server, json!({"workspace":"web"})),
+        vec!["named"]
+    );
+    assert!(listed_window_ids(&mut server, json!({"workspace":"14"})).is_empty());
+}
+
+#[test]
+fn the_server_tells_clients_to_use_it_for_this_desktop_instead_of_other_compositor_tools() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let initialized = server.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "instructions-check", "version": "1" }
+        }),
+    );
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    let tools = server.request("tools/list", json!({}));
+    let list_windows_description = tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "list_windows")
+        .and_then(|tool| tool["description"].as_str())
+        .expect("list_windows description")
+        .to_lowercase();
+
+    assert!(instructions.contains("this desktop"), "{instructions}");
+    for other_tool in ["hyprctl", "swaymsg", "wmctrl"] {
+        assert!(instructions.contains(other_tool), "{instructions}");
+    }
+    assert!(
+        list_windows_description.contains("workspace 4"),
+        "{list_windows_description}"
+    );
+}

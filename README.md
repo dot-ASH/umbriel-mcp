@@ -172,8 +172,10 @@ For `pi`, `claude-code`, and `vscode` this runs the harness's own CLI (`pi mcp a
 `claude mcp add`, `code --add-mcp`). For `opencode`, `cursor`, and `zed` it prints the
 configuration to paste; it never reads or edits your config files. A profile is added to
 the registration only if you pass `--profile`, so the default stays `full`. The pi
-registration uses direct exposure so the tools are offered to the model without codemode
-discovery. The Zed snippet keeps `"args": []` because Zed rejects its whole settings file
+registration uses direct exposure and a description, so the model sees the tools in its tool
+list and answers "what's on workspace 4?" with one `list_windows` call instead of searching
+for tools or trying `hyprctl`. If you registered by hand earlier, run `umbriel-mcp install pi`
+again to switch to direct exposure. The Zed snippet keeps `"args": []` because Zed rejects its whole settings file
 if it is missing.
 
 Any other MCP client can use the plain stdio form:
