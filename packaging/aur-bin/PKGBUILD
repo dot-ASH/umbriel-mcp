@@ -16,8 +16,8 @@ optdepends=('umbriel-git: the compositor this server controls'
             'tesseract-data-eng: English OCR language data')
 source_x86_64=("$_binary-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-x86_64-linux.tar.gz")
 source_aarch64=("$_binary-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-aarch64-linux.tar.gz")
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('d61e0dd7be5f9c4b5b2dff001ad9b1534da84d6805ff0bcb02bb9dc28e4b1a50')
+sha256sums_aarch64=('20820e0cb53552f0fcbc7a765c54daae6d2c6be4d05f3eabb96a5035a55b1cd9')
 
 package() {
   cd "$_binary-v$pkgver-$CARCH-linux"

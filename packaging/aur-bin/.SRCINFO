@@ -1,0 +1,22 @@
+pkgbase = umbriel-mcp-bin
+	pkgdesc = MCP server for the Umbriel Wayland compositor (prebuilt static binary)
+	pkgver = 0.2.1
+	pkgrel = 1
+	url = https://github.com/dot-ASH/umbriel-mcp
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	optdepends = umbriel-git: the compositor this server controls
+	optdepends = grim: screen capture
+	optdepends = tesseract: OCR tools
+	optdepends = tesseract-data-eng: English OCR language data
+	provides = umbriel-mcp
+	conflicts = umbriel-mcp
+	options = !debug
+	options = !strip
+	source_x86_64 = umbriel-mcp-0.2.1-x86_64.tar.gz::https://github.com/dot-ASH/umbriel-mcp/releases/download/v0.2.1/umbriel-mcp-v0.2.1-x86_64-linux.tar.gz
+	sha256sums_x86_64 = d61e0dd7be5f9c4b5b2dff001ad9b1534da84d6805ff0bcb02bb9dc28e4b1a50
+	source_aarch64 = umbriel-mcp-0.2.1-aarch64.tar.gz::https://github.com/dot-ASH/umbriel-mcp/releases/download/v0.2.1/umbriel-mcp-v0.2.1-aarch64-linux.tar.gz
+	sha256sums_aarch64 = 20820e0cb53552f0fcbc7a765c54daae6d2c6be4d05f3eabb96a5035a55b1cd9
+
+pkgname = umbriel-mcp-bin

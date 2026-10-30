@@ -32,7 +32,7 @@ helpers.
 
 | Distribution | Umbriel | umbriel-mcp |
 |---|---|---|
-| Arch Linux | AUR `umbriel-git` | AUR `umbriel-mcp-bin` |
+| Arch Linux | AUR `umbriel-git` | `makepkg` from this repo (AUR package planned) |
 | Ubuntu 26.04+ | Noctalia APT repository (`umbriel`) | release binary |
 | Debian Trixie / Sid | Noctalia APT repository (`umbriel`) | release binary |
 | Fedora | Terra (`umbriel-nightly`) | release binary |
@@ -55,9 +55,20 @@ they have changed.
 ```sh
 yay -S umbriel-git                                     # the compositor, if needed
 sudo pacman -S grim tesseract tesseract-data-eng       # screen capture and OCR
-yay -S umbriel-mcp-bin                                 # this server, prebuilt
+```
+
+Then install the server as a pacman package built from this repository's recipe. It downloads
+the prebuilt release binary and checks its checksum, so nothing is compiled:
+
+```sh
+git clone https://github.com/dot-ASH/umbriel-mcp
+cd umbriel-mcp/packaging/aur-bin
+makepkg -si
 umbriel-mcp doctor
 ```
+
+Remove it later with `sudo pacman -R umbriel-mcp-bin`. An AUR package of the same name is
+planned; this section will switch to `yay -S umbriel-mcp-bin` once it is published.
 
 ### Ubuntu 26.04 and newer
 
