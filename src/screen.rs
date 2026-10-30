@@ -4,6 +4,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat};
 use std::io::{Cursor, Write};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 pub const DEFAULT_MAX_WIDTH: u32 = 1024;
 const JPEG_QUALITY: u8 = 80;
@@ -19,6 +20,7 @@ pub struct Capture {
     pub encoded_height: u32,
     pub origin_x: i64,
     pub origin_y: i64,
+    pub shown_on_screen: bool,
 }
 
 impl Capture {
@@ -48,14 +50,21 @@ impl Capture {
             encoded_height: scaled.height(),
             origin_x: origin.0,
             origin_y: origin.1,
+            shown_on_screen: true,
         })
     }
 
     pub fn coordinate_note(&self) -> String {
         let factor = self.native_width as f64 / self.encoded_width.max(1) as f64;
+        let visibility = if self.shown_on_screen {
+            ""
+        } else {
+            " The window is not currently shown (its workspace is hidden or it is minimized), \
+             so these screen coordinates only apply after switching to its workspace."
+        };
         format!(
             "Image is {}x{} covering a {}x{} region whose top-left is absolute ({}, {}). \
-             To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}.",
+             To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}.{visibility}",
             self.encoded_width,
             self.encoded_height,
             self.native_width,
@@ -91,14 +100,6 @@ fn grim(extra_args: &[String]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
-fn parse_origin(geometry: &str) -> (i64, i64) {
-    let position = geometry.split_whitespace().next().unwrap_or("0,0");
-    let mut parts = position.split(',');
-    let x = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let y = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    (x, y)
-}
-
 fn output_origin(output_name: &str) -> (i64, i64) {
     let Ok(outputs) = crate::ipc::query("outputs") else {
         return (0, 0);
@@ -121,15 +122,52 @@ fn output_origin(output_name: &str) -> (i64, i64) {
     (0, 0)
 }
 
+fn grim_supports_toplevel_capture() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        Command::new("grim")
+            .arg("-h")
+            .output()
+            .map(|output| {
+                let help = [output.stdout, output.stderr].concat();
+                String::from_utf8_lossy(&help).contains("-T <")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlacement)> {
+    let placement = crate::ipc::window_placement(window_id)?;
+    let png = if grim_supports_toplevel_capture() {
+        grim(&["-T".into(), window_id.to_owned()]).map_err(|error| {
+            if error.to_string().contains("cannot find toplevel") {
+                anyhow!("no window with id {window_id} can be captured")
+            } else {
+                error
+            }
+        })?
+    } else if placement.shown_on_screen {
+        grim(&["-g".into(), placement.geometry.clone()])?
+    } else {
+        return Err(anyhow!(
+            "window {window_id} is not currently shown, and capturing a window that is not on \
+             screen needs grim 1.5 or newer (`grim -T`); this grim can only capture what is \
+             displayed. Switch to its workspace first, or upgrade grim."
+        ));
+    };
+    Ok((png, placement))
+}
+
 pub fn capture(output: Option<&str>, window_id: Option<&str>, max_width: u32) -> Result<Capture> {
-    let (png, origin) = match (output, window_id) {
-        (_, Some(id)) => {
-            let geometry = crate::ipc::window_geometry(id)?;
-            let origin = parse_origin(&geometry);
-            (grim(&["-g".into(), geometry])?, origin)
-        }
-        (Some(name), None) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
-        (None, None) => (grim(&[])?, (0, 0)),
+    if let Some(id) = window_id {
+        let (png, placement) = capture_window(id)?;
+        let mut capture = Capture::from_png(&png, placement.origin, max_width)?;
+        capture.shown_on_screen = placement.shown_on_screen;
+        return Ok(capture);
+    }
+    let (png, origin) = match output {
+        Some(name) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
+        None => (grim(&[])?, (0, 0)),
     };
     Capture::from_png(&png, origin, max_width)
 }

@@ -57,7 +57,13 @@ pub fn windows() -> Result<Vec<Value>> {
     Ok(query("windows")?.as_array().cloned().unwrap_or_default())
 }
 
-pub fn window_geometry(window_id: &str) -> Result<String> {
+pub struct WindowPlacement {
+    pub geometry: String,
+    pub origin: (i64, i64),
+    pub shown_on_screen: bool,
+}
+
+pub fn window_placement(window_id: &str) -> Result<WindowPlacement> {
     let matching = windows()?
         .into_iter()
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(window_id))
@@ -69,11 +75,13 @@ pub fn window_geometry(window_id: &str) -> Result<String> {
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("window {window_id} has no {key}"))
     };
-    Ok(format!(
-        "{},{} {}x{}",
-        number("x")?,
-        number("y")?,
-        number("w")?,
-        number("h")?
-    ))
+    let (x, y) = (number("x")?, number("y")?);
+    Ok(WindowPlacement {
+        geometry: format!("{x},{y} {}x{}", number("w")?, number("h")?),
+        origin: (x, y),
+        shown_on_screen: matching
+            .get("visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    })
 }

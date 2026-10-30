@@ -153,7 +153,7 @@ struct KeyRequest {
 struct CaptureRequest {
     /// Capture only this output, such as "HDMI-A-1"
     output: Option<String>,
-    /// Capture only this window id
+    /// Capture only this window id, even if it is on a workspace that is not shown
     window_id: Option<String>,
     /// Downscale so the image is at most this wide
     max_width: Option<u32>,
@@ -420,7 +420,9 @@ impl UmbrielServer {
         Ok(format!("pressed {}", request.keys))
     }
 
-    #[tool(description = "Capture the screen, one output, or one window, as a downscaled image.")]
+    #[tool(
+        description = "Capture the screen, one output, or one window as a downscaled image. A window_id captures that window even on a hidden workspace, without switching to it."
+    )]
     fn screenshot(
         &self,
         Parameters(request): Parameters<CaptureRequest>,
@@ -437,7 +439,9 @@ impl UmbrielServer {
         ]))
     }
 
-    #[tool(description = "Capture the screen and return the text found in it by OCR.")]
+    #[tool(
+        description = "Capture the screen, one output, or one window and return the text found in it by OCR. A window_id reads that window even on a hidden workspace, without switching to it."
+    )]
     fn screenshot_with_ocr(
         &self,
         Parameters(request): Parameters<CaptureRequest>,

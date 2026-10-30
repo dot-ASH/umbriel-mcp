@@ -811,3 +811,143 @@ fn the_server_tells_clients_to_use_it_for_this_desktop_instead_of_other_composit
         "{list_windows_description}"
     );
 }
+
+fn one_visible_and_one_hidden_window() -> HashMap<String, Value> {
+    HashMap::from([(
+        "windows".to_string(),
+        json!({
+            "ok": [
+                { "id": "shown", "title": "editor", "output": "DP-1", "workspace": "DP-1:1",
+                  "visible": true, "x": 1932, "y": 46, "w": 900, "h": 500 },
+                { "id": "hidden", "title": "Figma", "output": "HDMI-A-1", "workspace": "HDMI-A-1:4",
+                  "visible": false, "x": 12, "y": 46, "w": 1896, "h": 1022 }
+            ]
+        }),
+    )])
+}
+
+fn recording_grim(tools: &std::path::Path, supports_toplevel_capture: bool) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let record = tools.join("grim.args");
+    let help = if supports_toplevel_capture {
+        "  -T <identifier> Set the identifier of a foreign toplevel handle to capture."
+    } else {
+        "  -g <geometry>   Set the region to capture."
+    };
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then echo 'Usage: grim [options...] [output-file]'; echo '{help}'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$5\" = \"-T\" ] && [ \"$6\" != \"shown\" ] && [ \"$6\" != \"hidden\" ]; then echo 'cannot find toplevel' >&2; exit 1; fi\nexec /usr/bin/cat '{OCR_FIXTURE}'\n",
+        record.display()
+    );
+    let path = tools.join("grim");
+    std::fs::write(&path, script).expect("write fake grim");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    record
+}
+
+fn grim_arguments(record: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn start_with_grim(
+    supports_toplevel_capture: bool,
+) -> (FakeUmbriel, McpProcess, std::path::PathBuf) {
+    let fake = FakeUmbriel::start(one_visible_and_one_hidden_window());
+    let tools = fake_tools_directory(None, None);
+    let record = recording_grim(&tools, supports_toplevel_capture);
+    let server = start_with_tools(&fake, &tools, "/usr/bin");
+    (fake, server, record)
+}
+
+#[test]
+fn a_window_on_a_hidden_workspace_is_captured_by_its_id_without_switching() {
+    let (fake, mut server, record) = start_with_grim(true);
+
+    let response = server.call_tool("screenshot", json!({"window_id":"hidden"}));
+
+    assert!(response.get("result").is_some(), "{response}");
+    let arguments = grim_arguments(&record);
+    assert!(
+        arguments.windows(2).any(|pair| pair == ["-T", "hidden"]),
+        "{arguments:?}"
+    );
+    assert!(!arguments.contains(&"-g".to_owned()), "{arguments:?}");
+    assert_eq!(
+        compositor_actions(&fake),
+        Vec::<String>::new(),
+        "capture must not switch workspaces"
+    );
+    let note = text_content(&response);
+    assert!(note.contains("not currently shown"), "{note}");
+}
+
+#[test]
+fn a_visible_window_capture_reports_screen_coordinates_from_its_position() {
+    let (_fake, mut server, _record) = start_with_grim(true);
+
+    let response = server.call_tool("screenshot", json!({"window_id":"shown"}));
+
+    let note = text_content(&response);
+    assert!(note.contains("absolute (1932, 46)"), "{note}");
+    assert!(!note.contains("not currently shown"), "{note}");
+}
+
+#[test]
+fn an_older_grim_falls_back_to_the_region_of_a_visible_window() {
+    let (_fake, mut server, record) = start_with_grim(false);
+
+    let response = server.call_tool("screenshot", json!({"window_id":"shown"}));
+
+    assert!(response.get("result").is_some(), "{response}");
+    let arguments = grim_arguments(&record);
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-g", "1932,46 900x500"]),
+        "{arguments:?}"
+    );
+}
+
+#[test]
+fn an_older_grim_refuses_a_hidden_window_instead_of_capturing_whatever_covers_it() {
+    let (_fake, mut server, record) = start_with_grim(false);
+
+    let response = server.call_tool("screenshot", json!({"window_id":"hidden"}));
+
+    let message = error_message(&response);
+    assert!(message.contains("grim 1.5"), "{message}");
+    assert!(message.contains("not currently shown"), "{message}");
+    assert!(
+        grim_arguments(&record).is_empty(),
+        "nothing should be captured"
+    );
+}
+
+#[test]
+fn an_unknown_window_id_is_reported_as_such() {
+    let (_fake, mut server, _record) = start_with_grim(true);
+
+    let response = server.call_tool("screenshot", json!({"window_id":"nope"}));
+
+    assert!(
+        error_message(&response).contains("no window with id nope"),
+        "{response}"
+    );
+}
+
+#[test]
+fn ocr_can_read_a_window_on_a_hidden_workspace() {
+    let (_fake, mut server, record) = start_with_grim(true);
+
+    let response = server.call_tool("screenshot_with_ocr", json!({"window_id":"hidden"}));
+
+    assert!(
+        text_content(&response).contains("Cancel"),
+        "{}",
+        text_content(&response)
+    );
+    assert!(grim_arguments(&record).contains(&"-T".to_owned()));
+}
