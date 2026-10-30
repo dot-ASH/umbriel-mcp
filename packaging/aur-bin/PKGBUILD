@@ -1,7 +1,7 @@
 # Maintainer: Nafees Ashker Sakir <nafees.ashker@gmail.com>
 pkgname=umbriel-mcp-bin
 _binary=umbriel-mcp
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="MCP server for the Umbriel Wayland compositor (prebuilt static binary)"
 arch=('x86_64' 'aarch64')

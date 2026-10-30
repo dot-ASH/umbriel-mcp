@@ -13,9 +13,27 @@ credentials.
 4. Publish the crate: `cargo publish`.
 5. Publish the registry entry (the crate must already be on crates.io):
    `mcp-publisher login github && mcp-publisher publish`.
-6. Update the AUR package: in `packaging/aur-bin`, run `updpkgsums`, check `makepkg -f`, then push
-   `PKGBUILD` and a regenerated `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`) to
-   `ssh://aur@aur.archlinux.org/umbriel-mcp-bin.git`.
+6. Update the AUR package (needs an AUR account with your SSH key, and `pacman-contrib` for
+   `updpkgsums`). In a scratch directory:
+
+   ```sh
+   git clone ssh://aur@aur.archlinux.org/umbriel-mcp-bin.git
+   cd umbriel-mcp-bin
+   cp ~/Projects/umbriel-mcp/packaging/aur-bin/PKGBUILD .
+   updpkgsums
+   makepkg -f
+   makepkg --printsrcinfo > .SRCINFO
+   git add PKGBUILD .SRCINFO
+   git commit -m "Update to X.Y.Z"
+   git push
+   ```
+
+   Commit the updated checksums back to `packaging/aur-bin/PKGBUILD` too.
+
+The registry name `io.github.dot-ASH/umbriel-mcp` is case-sensitive and must match the GitHub
+owner exactly. The registry checks it against the `mcp-name:` line of the README published on
+crates.io, so a wrong name can only be fixed by publishing a new crate version.
+`tests/release_metadata.rs` guards both.
 
 `packaging/PKGBUILD` is a build-from-source recipe kept as a starting point for contributors; it
 is not published.

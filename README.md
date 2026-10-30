@@ -1,6 +1,6 @@
 # umbriel-mcp
 
-mcp-name: io.github.dot-ash/umbriel-mcp
+mcp-name: io.github.dot-ASH/umbriel-mcp
 
 An MCP server for the [Umbriel](https://docs.noctalia.dev/umbriel/) Wayland compositor.
 
@@ -82,7 +82,7 @@ umbriel-mcp doctor
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.2.0
+   tag=v0.2.1
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
