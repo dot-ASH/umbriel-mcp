@@ -74,6 +74,9 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("clipboard_write", Access::Control),
     ("set_keybind", Access::Control),
     ("remove_keybind", Access::Control),
+    ("set_option", Access::Control),
+    ("reset_option", Access::Control),
+    ("apply_config_change", Access::Control),
     ("launch_app", Access::Execute),
 ];
 

@@ -141,7 +141,7 @@ fn a_harness_cli_that_fails_is_not_reported_as_registered() {
 }
 
 #[test]
-fn snippet_harnesses_print_config_and_touch_nothing() {
+fn without_their_cli_snippet_harnesses_print_config_and_touch_nothing() {
     for (harness, expected) in [
         ("opencode", "\"mcp\""),
         ("cursor", "\"mcpServers\""),
@@ -192,4 +192,157 @@ fn an_unsupported_harness_lists_the_supported_ones() {
             "should list {supported}: {stderr}"
         );
     }
+}
+
+fn install_program_with_help(directory: &Path, name: &str, help: &str) -> PathBuf {
+    let record = directory.join(format!("{name}.args"));
+    let path = directory.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$2\" = \"--help\" ]; then printf '%s\\n' '{help}'; fi\nexit 0\n",
+            record.display()
+        ),
+    )
+    .expect("write fake harness");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    record
+}
+
+fn recorded_invocations(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn opencode_registration_runs_opencode_mcp_add() {
+    let programs = scratch_directory("opencode-bin");
+    let home = scratch_directory("opencode-home");
+    let record = install_recording_program(&programs, "opencode", 0);
+
+    let output = run_install(&["opencode", "--profile", "no-exec"], &programs, &home);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let arguments = recorded(&record);
+    assert_eq!(&arguments[..4], ["mcp", "add", "umbriel", "--"]);
+    assert!(arguments[4].ends_with("umbriel-mcp"), "{arguments:?}");
+    assert_eq!(&arguments[5..], ["--profile", "no-exec"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Registered umbriel with opencode"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Add this to"), "{stdout}");
+    assert!(
+        directory_is_empty(&home),
+        "install must not write into HOME"
+    );
+}
+
+#[test]
+fn a_failing_opencode_is_not_reported_as_registered() {
+    let programs = scratch_directory("opencode-fail-bin");
+    let home = scratch_directory("opencode-fail-home");
+    install_recording_program(&programs, "opencode", 1);
+
+    let output = run_install(&["opencode"], &programs, &home);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Registered"));
+}
+
+#[test]
+fn without_opencode_the_snippet_explains_why_it_is_shown() {
+    let programs = scratch_directory("opencode-missing-bin");
+    let home = scratch_directory("opencode-missing-home");
+
+    let output = run_install(&["opencode"], &programs, &home);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("`opencode` was not found on PATH"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"type\": \"local\""), "{stdout}");
+}
+
+#[test]
+fn a_cursor_agent_that_offers_mcp_add_registers_umbriel() {
+    let programs = scratch_directory("cursor-bin");
+    let home = scratch_directory("cursor-home");
+    let record = install_program_with_help(
+        &programs,
+        "cursor-agent",
+        "Commands:\n  list   List servers\n  add <name>   Add a server",
+    );
+
+    let output = run_install(&["cursor"], &programs, &home);
+
+    let invocations = recorded_invocations(&record);
+    assert_eq!(invocations[0], "mcp --help");
+    assert!(
+        invocations[1].starts_with("mcp add umbriel -- "),
+        "{invocations:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Registered umbriel with cursor-agent")
+    );
+    assert!(directory_is_empty(&home));
+}
+
+#[test]
+fn a_cursor_agent_without_mcp_add_falls_back_to_the_snippet() {
+    let programs = scratch_directory("cursor-old-bin");
+    let home = scratch_directory("cursor-old-home");
+    let record = install_program_with_help(
+        &programs,
+        "cursor-agent",
+        "Commands:\n  list   List servers\n  enable <id>   Approve a server",
+    );
+
+    let output = run_install(&["cursor"], &programs, &home);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("has no `mcp add` command"), "{stdout}");
+    assert!(stdout.contains("\"mcpServers\""), "{stdout}");
+    assert_eq!(
+        recorded_invocations(&record),
+        ["mcp --help"],
+        "only the help may run"
+    );
+    assert!(directory_is_empty(&home));
+}
+
+#[test]
+fn reinstalling_claude_code_removes_the_old_entry_quietly_then_adds() {
+    let programs = scratch_directory("claude-again-bin");
+    let home = scratch_directory("claude-again-home");
+    let record = install_program_with_help(&programs, "claude", "");
+
+    let output = run_install(&["claude-code", "--profile", "read-only"], &programs, &home);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let invocations = recorded_invocations(&record);
+    assert_eq!(invocations[0], "mcp remove --scope user umbriel");
+    assert!(
+        invocations[1].starts_with("mcp add --scope user umbriel -- "),
+        "{invocations:?}"
+    );
+    assert!(
+        invocations[1].ends_with("--profile read-only"),
+        "{invocations:?}"
+    );
 }

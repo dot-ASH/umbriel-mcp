@@ -93,7 +93,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.2.1
+   tag=v0.2.2
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -174,20 +174,32 @@ The socket is found through `UMBRIEL_SOCKET`, falling back to
 ## Register with your harness
 
 ```sh
-umbriel-mcp install pi            # also: claude-code, vscode
-umbriel-mcp install opencode      # also: cursor, zed (prints config to paste)
+umbriel-mcp install pi            # also: claude-code, vscode, opencode, cursor
+umbriel-mcp install zed           # prints config to paste
 umbriel-mcp install claude-code --profile no-exec
 ```
 
-For `pi`, `claude-code`, and `vscode` this runs the harness's own CLI (`pi mcp add`,
-`claude mcp add`, `code --add-mcp`). For `opencode`, `cursor`, and `zed` it prints the
-configuration to paste; it never reads or edits your config files. A profile is added to
-the registration only if you pass `--profile`, so the default stays `full`. The pi
-registration uses direct exposure and a description, so the model sees the tools in its tool
-list and answers "what's on workspace 4?" with one `list_windows` call instead of searching
-for tools or trying `hyprctl`. If you registered by hand earlier, run `umbriel-mcp install pi`
-again to switch to direct exposure. The Zed snippet keeps `"args": []` because Zed rejects its whole settings file
-if it is missing.
+This registers the server through each harness's own CLI, so umbriel-mcp never reads or
+edits their config files itself:
+
+| Harness | Runs |
+|---|---|
+| pi | `pi mcp add` with direct exposure and a description |
+| Claude Code | `claude mcp add --scope user` |
+| VS Code | `code --add-mcp` |
+| opencode | `opencode mcp add` |
+| Cursor | `cursor-agent mcp add`, if your `cursor-agent` has it |
+| Zed | nothing: Zed has no CLI for this, so the config to paste is printed |
+
+If opencode's or Cursor's CLI is not installed, or Cursor's has no `mcp add`, the config to
+paste is printed instead. A profile is added to the registration only if you pass
+`--profile`, so the default stays `full`.
+
+The pi registration uses direct exposure, so the model sees the tools in its tool list and
+answers "what's on workspace 4?" with one `list_windows` call instead of searching for tools or
+trying `hyprctl`. If you registered pi by hand earlier, run `umbriel-mcp install pi` again to
+switch to direct exposure. The Zed snippet keeps `"args": []` because Zed rejects its whole
+settings file if it is missing.
 
 Any other MCP client can use the plain stdio form:
 
@@ -241,14 +253,36 @@ read from the installed `umbriel` command and your config, so they match the ver
 The schema has no prose descriptions; explanations live in the
 [Umbriel documentation](https://docs.noctalia.dev/umbriel/).
 
-**Changing keybinds** — `set_keybind` and `remove_keybind` edit the `[keybinds]` table of your
-`~/.config/umbriel/config.toml`. Each edit is checked with `umbriel config validate` before the
-file is replaced, so a rejected action or chord never goes live. The previous config is saved
-next to it as `config.toml.bak-<time>`, only the changed line differs (comments and formatting
-are kept), a symlinked config stays a symlink, and a chord bound in an `[include]` file is left
-alone. Umbriel applies the change immediately. `read-only` refuses edits, and `no-exec` refuses
-any binding to a `spawn:` action, because a keybind that starts a program would let an agent run
-commands later through you. Backups are not cleaned up automatically.
+**Changing settings** — `set_option` and `reset_option` change one setting, such as
+`layout.gap` or `appearance.blur.enabled`, and `set_keybind` and `remove_keybind` change
+keybinds. Keys and values are checked against Umbriel's schema (type, range, allowed values),
+then the edited config is checked with `umbriel config validate`. Rule lists such as
+`window_rule` are not editable yet.
+
+**Every change needs your approval before anything is written:**
+
+- In clients that support MCP elicitation (Claude Code 2.1.76+, VS Code, Cursor, opencode v2),
+  you get a dialog showing the exact change, with a checkbox for keeping a backup. Only your approval writes it; the model cannot
+  answer the dialog. No answer within 10 minutes writes nothing.
+- In clients without it (pi, opencode 1.x), the tool writes nothing and returns the change with
+  a one-time confirmation code. The model is told to show you the change, ask whether to keep a
+  backup, and wait for your answer before calling `apply_config_change`. This relies on the model following that instruction,
+  so it is weaker than a dialog. All write tools are marked destructive, so a harness
+  permission prompt or extension can ask you as well.
+- A code expires after 10 minutes, works once, and is refused if the file changed since the
+  preview.
+
+The same approval step asks whether to keep a backup of the previous config. If you say yes,
+or don't answer that question, it is saved next to the config as `config.toml.bak-<time>`; say
+no to avoid collecting backup files. Backups are never deleted automatically. When a change is
+written, only the changed lines differ (comments and formatting are kept), a symlinked config
+stays a symlink, and Umbriel applies it immediately.
+
+Profiles still apply. `read-only` refuses all changes. `no-exec` refuses `spawn:` keybinds and
+hot-corner actions, and settings that can start programs, load files, or weaken a security
+check (`general.autostart`, `events`, `environment`, `include`, effect shaders, `drm`,
+`screencast.disable_dynamic_confirmation`); those need `full`. Disabling your only enabled
+output is always refused, and keyboard-layout or `general.mod_key` changes come with a warning.
 
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
 `click_text`, `clipboard_read`, `clipboard_write`. With a `window_id`, `screenshot` and

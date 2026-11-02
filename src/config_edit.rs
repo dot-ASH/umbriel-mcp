@@ -153,8 +153,19 @@ pub fn plan_remove_keybind(config: &str, chord: &str) -> Result<KeybindEdit> {
         .and_then(Item::as_table_like_mut)
         .ok_or_else(not_bound)?;
     let key = existing_chord(table, chord).ok_or_else(not_bound)?;
+    let previous = remove_keeping_comments_above(table, &key)
+        .as_ref()
+        .and_then(bound_action);
+    Ok(KeybindEdit {
+        chord: key,
+        new_text: document.to_string(),
+        previous,
+    })
+}
+
+pub fn remove_keeping_comments_above(table: &mut dyn TableLike, key: &str) -> Option<Item> {
     let leading_comments = table
-        .key(&key)
+        .key(key)
         .and_then(|key| key.leaf_decor().prefix())
         .and_then(|prefix| prefix.as_str())
         .map(str::to_owned)
@@ -162,9 +173,9 @@ pub fn plan_remove_keybind(config: &str, chord: &str) -> Result<KeybindEdit> {
     let next_key = table
         .iter()
         .map(|(name, _)| name.to_owned())
-        .skip_while(|name| name != &key)
+        .skip_while(|name| name != key)
         .nth(1);
-    let previous = table.remove(&key).as_ref().and_then(bound_action);
+    let removed = table.remove(key);
     if let Some(next_key) = next_key
         && let Some(mut next) = table.key_mut(&next_key)
     {
@@ -177,11 +188,7 @@ pub fn plan_remove_keybind(config: &str, chord: &str) -> Result<KeybindEdit> {
         next.leaf_decor_mut()
             .set_prefix(format!("{leading_comments}{next_prefix}"));
     }
-    Ok(KeybindEdit {
-        chord: key,
-        new_text: document.to_string(),
-        previous,
-    })
+    removed
 }
 
 pub fn changed_lines(before: &str, after: &str) -> String {
@@ -374,134 +381,173 @@ fn write_new_backup(config_file: &Path, original: &str) -> Result<PathBuf> {
     unreachable!("an unused backup name is always found")
 }
 
-struct AppliedEdit {
-    edit: KeybindEdit,
-    config_file: PathBuf,
-    backup: PathBuf,
-    change: String,
+pub struct PreparedChange {
+    pub config_file: PathBuf,
+    original: String,
+    new_text: String,
+    pub summary: String,
+    pub change: String,
+    pub caution: Option<String>,
 }
 
-fn apply(
-    chord: &str,
-    plan: impl FnOnce(&str) -> Result<KeybindEdit>,
-) -> Result<Option<AppliedEdit>> {
-    let config_file = user_config_file()?;
-    let original = std::fs::read_to_string(&config_file)
-        .with_context(|| format!("cannot read {}", config_file.display()))?;
-    refuse_chords_owned_by_included_files(&config_file, &original, chord)?;
-    let edit = plan(&original)?;
-    if edit.new_text == original {
-        return Ok(None);
+impl PreparedChange {
+    pub fn preview(&self) -> String {
+        let caution = self
+            .caution
+            .as_deref()
+            .map(|caution| format!("\nCaution: {caution}"))
+            .unwrap_or_default();
+        format!(
+            "{} in {}\n{}{caution}",
+            self.summary,
+            self.config_file.display(),
+            self.change
+        )
     }
+}
 
-    let candidate = config_file.with_file_name(format!(
+fn candidate_path(config_file: &Path) -> PathBuf {
+    config_file.with_file_name(format!(
         ".{}.umbriel-mcp-{}",
         config_file
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default(),
         std::process::id()
-    ));
-    std::fs::write(&candidate, &edit.new_text)
+    ))
+}
+
+fn check_with_umbriel(config_file: &Path, new_text: &str) -> Result<()> {
+    let candidate = candidate_path(config_file);
+    std::fs::write(&candidate, new_text)
         .with_context(|| format!("cannot write {}", candidate.display()))?;
     let verdict = validate(&candidate);
-    let rejection = match verdict {
-        Ok(Ok(())) => None,
-        Ok(Err(report)) => Some(readable_validation_report(
-            &report,
-            &candidate,
-            &config_file,
-        )),
-        Err(error) => {
-            let _ = std::fs::remove_file(&candidate);
-            return Err(error);
-        }
+    let _ = std::fs::remove_file(&candidate);
+    let report = match verdict? {
+        Ok(()) => return Ok(()),
+        Err(report) => readable_validation_report(&report, &candidate, config_file),
     };
-    if let Some(report) = rejection {
-        let _ = std::fs::remove_file(&candidate);
-        let already_invalid = matches!(validate(&config_file), Ok(Err(_)));
-        return Err(if already_invalid {
-            anyhow!(
-                "{} already fails `umbriel config validate`, so the change could not be checked \
-                 and nothing was written. Fix the existing problems first:\n{report}",
-                config_file.display()
-            )
-        } else {
-            anyhow!(
-                "Umbriel rejected the change, so {} was not modified:\n{report}",
-                config_file.display()
-            )
-        });
-    }
+    let already_invalid = matches!(validate(config_file), Ok(Err(_)));
+    Err(if already_invalid {
+        anyhow!(
+            "{} already fails `umbriel config validate`, so the change could not be checked \
+             and nothing was written. Fix the existing problems first:\n{report}",
+            config_file.display()
+        )
+    } else {
+        anyhow!(
+            "Umbriel rejected the change, so {} was not modified:\n{report}",
+            config_file.display()
+        )
+    })
+}
 
-    let finish = || -> Result<PathBuf> {
-        let backup = write_new_backup(&config_file, &original)?;
-        let permissions = std::fs::metadata(&config_file)?.permissions();
-        std::fs::set_permissions(&candidate, permissions)?;
-        std::fs::rename(&candidate, &config_file)
-            .with_context(|| format!("cannot replace {}", config_file.display()))?;
-        Ok(backup)
-    };
-    let backup = match finish() {
-        Ok(backup) => backup,
-        Err(error) => {
-            let _ = std::fs::remove_file(&candidate);
-            return Err(error);
-        }
-    };
-    let change = changed_lines(&original, &edit.new_text);
-    Ok(Some(AppliedEdit {
-        edit,
+pub fn load_user_config() -> Result<(PathBuf, String)> {
+    let config_file = user_config_file()?;
+    let original = std::fs::read_to_string(&config_file)
+        .with_context(|| format!("cannot read {}", config_file.display()))?;
+    Ok((config_file, original))
+}
+
+pub fn prepare(
+    config_file: PathBuf,
+    original: String,
+    new_text: String,
+    summary: String,
+    caution: Option<String>,
+) -> Result<Option<PreparedChange>> {
+    if new_text == original {
+        return Ok(None);
+    }
+    check_with_umbriel(&config_file, &new_text)?;
+    let change = changed_lines(&original, &new_text);
+    Ok(Some(PreparedChange {
         config_file,
-        backup,
+        original,
+        new_text,
+        summary,
         change,
+        caution,
     }))
 }
 
-fn report(applied: &AppliedEdit, summary: String) -> String {
-    format!(
-        "{summary} in {}. Umbriel applies it as soon as the file is saved.\nBackup of the previous \
-         config: {}\nChange:\n{}",
-        applied.config_file.display(),
-        applied.backup.display(),
-        applied.change
-    )
-}
-
-pub fn set_keybind(chord: &str, action: &str, repeat: Option<bool>) -> Result<String> {
-    let Some(applied) = apply(chord, |config| {
-        plan_set_keybind(config, chord, action, repeat)
-    })?
-    else {
-        return Ok(format!(
-            "{chord} is already bound to {}; nothing changed",
-            action.trim()
+pub fn commit(prepared: &PreparedChange, keep_backup: bool) -> Result<String> {
+    let config_file = &prepared.config_file;
+    let current = std::fs::read_to_string(config_file)
+        .with_context(|| format!("cannot read {}", config_file.display()))?;
+    if current != prepared.original {
+        return Err(anyhow!(
+            "{} changed after this change was previewed, so nothing was written; \
+             make the request again to preview it against the current file",
+            config_file.display()
         ));
+    }
+    let candidate = candidate_path(config_file);
+    let finish = || -> Result<Option<PathBuf>> {
+        std::fs::write(&candidate, &prepared.new_text)
+            .with_context(|| format!("cannot write {}", candidate.display()))?;
+        let backup = if keep_backup {
+            Some(write_new_backup(config_file, &prepared.original)?)
+        } else {
+            None
+        };
+        let permissions = std::fs::metadata(config_file)?.permissions();
+        std::fs::set_permissions(&candidate, permissions)?;
+        std::fs::rename(&candidate, config_file)
+            .with_context(|| format!("cannot replace {}", config_file.display()))?;
+        Ok(backup)
     };
-    let replaced = match &applied.edit.previous {
-        Some(previous) => format!(" (was {previous})"),
-        None => String::new(),
+    let backup = finish().inspect_err(|_| {
+        let _ = std::fs::remove_file(&candidate);
+    })?;
+    let backup_note = match backup {
+        Some(backup) => format!("Backup of the previous config: {}", backup.display()),
+        None => "No backup was kept, as requested.".to_owned(),
     };
-    let summary = format!(
-        "Bound {} to {}{replaced}",
-        applied.edit.chord,
-        action.trim()
-    );
-    Ok(report(&applied, summary))
+    Ok(format!(
+        "Applied: {} in {}. Umbriel applies it as soon as the file is saved.\n{backup_note}\n\
+         Change:\n{}",
+        prepared.summary,
+        config_file.display(),
+        prepared.change
+    ))
 }
 
-pub fn remove_keybind(chord: &str) -> Result<String> {
-    let applied = apply(chord, |config| plan_remove_keybind(config, chord))?.ok_or_else(|| {
-        anyhow!("{chord} is not bound in the Umbriel config, so nothing was removed")
-    })?;
-    let was = applied
-        .edit
-        .previous
-        .as_deref()
+fn was(previous: Option<&str>) -> String {
+    previous
         .map(|previous| format!(" (was {previous})"))
-        .unwrap_or_default();
-    let summary = format!("Removed the binding for {}{was}", applied.edit.chord);
-    Ok(report(&applied, summary))
+        .unwrap_or_default()
+}
+
+pub fn prepare_set_keybind(
+    chord: &str,
+    action: &str,
+    repeat: Option<bool>,
+) -> Result<Option<PreparedChange>> {
+    let (config_file, original) = load_user_config()?;
+    refuse_chords_owned_by_included_files(&config_file, &original, chord)?;
+    let edit = plan_set_keybind(&original, chord, action, repeat)?;
+    let summary = format!(
+        "Bind {} to {}{}",
+        edit.chord,
+        action.trim(),
+        was(edit.previous.as_deref())
+    );
+    prepare(config_file, original, edit.new_text, summary, None)
+}
+
+pub fn prepare_remove_keybind(chord: &str) -> Result<PreparedChange> {
+    let (config_file, original) = load_user_config()?;
+    refuse_chords_owned_by_included_files(&config_file, &original, chord)?;
+    let edit = plan_remove_keybind(&original, chord)?;
+    let summary = format!(
+        "Remove the binding for {}{}",
+        edit.chord,
+        was(edit.previous.as_deref())
+    );
+    prepare(config_file, original, edit.new_text, summary, None)?.ok_or_else(|| {
+        anyhow!("{chord} is not bound in the Umbriel config, so nothing was removed")
+    })
 }
 
 #[cfg(test)]

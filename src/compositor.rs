@@ -245,10 +245,21 @@ pub fn list_actions(filter: Option<&str>) -> Result<String> {
     Ok(listing)
 }
 
+fn schema() -> Result<Value> {
+    serde_json::from_str(&run_umbriel(&["config", "schema", "--json"])?)
+        .context("`umbriel config schema --json` did not print JSON")
+}
+
+pub fn schema_options() -> Result<Vec<Value>> {
+    schema()?
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow!("the Umbriel config schema has no option list"))
+}
+
 pub fn config_options(query: Option<&str>) -> Result<Value> {
-    let schema: Value = serde_json::from_str(&run_umbriel(&["config", "schema", "--json"])?)
-        .context("`umbriel config schema --json` did not print JSON")?;
-    options_matching(&schema, query)
+    options_matching(&schema()?, query)
 }
 
 fn existing_config() -> Option<(PathBuf, bool)> {

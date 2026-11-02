@@ -1,3 +1,4 @@
+mod approval;
 mod compositor;
 mod config_edit;
 mod doctor;
@@ -7,11 +8,11 @@ mod keyboard;
 mod profile;
 mod register;
 mod screen;
+mod setting;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
 use clap::Parser;
 use profile::Profile;
-use rmcp::RoleServer;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -19,8 +20,10 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
+use rmcp::{Peer, RoleServer};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use std::sync::Arc;
 
 fn failed(error: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(format!("{error:#}"), None)
@@ -199,6 +202,28 @@ struct KeybindRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OptionChange {
+    /// Setting key from config_options, such as "layout.gap" or "output.DP-1.scale"
+    key: String,
+    /// New value: a number, true/false, a string, or a list, matching the setting's type
+    value: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OptionKey {
+    /// Setting key to reset to Umbriel's default, such as "layout.gap"
+    key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConfirmationCode {
+    /// Confirmation code returned with the previewed change
+    confirmation: String,
+    /// Whether the user wants a backup of the previous config kept; omit to keep one
+    backup: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct KeybindChord {
     /// Key chord to unbind, such as "Mod+F"
     chord: String,
@@ -218,6 +243,59 @@ struct LayoutRequest {
 #[derive(Clone)]
 struct UmbrielServer {
     profile: Profile,
+    pending_changes: Arc<approval::PendingChanges>,
+}
+
+impl UmbrielServer {
+    fn new(profile: Profile) -> Self {
+        Self {
+            profile,
+            pending_changes: Arc::default(),
+        }
+    }
+
+    fn permit_setting(
+        &self,
+        tool: &str,
+        key: &str,
+        value: Option<&serde_json::Value>,
+    ) -> Result<(), ErrorData> {
+        match setting::policy(key) {
+            setting::Policy::UseKeybindTools => Err(ErrorData::invalid_params(
+                format!(
+                    "`{}` is a keybind; use set_keybind or remove_keybind for keybinds",
+                    key.trim()
+                ),
+                None,
+            )),
+            setting::Policy::RunsProgramsOrLoadsFiles | setting::Policy::WeakensSecurity
+                if value.is_some() && self.profile < Profile::Full =>
+            {
+                Err(refused(format!(
+                    "`{tool}` cannot change `{}` in the `{}` profile: it can start programs, load \
+                     files, or weaken a security check. Restart umbriel-mcp with `--profile full` to \
+                     allow it.",
+                    key.trim(),
+                    self.profile
+                )))
+            }
+            setting::Policy::TakesAnAction => match value.and_then(serde_json::Value::as_str) {
+                Some(action) => self.profile.permit_action(tool, action).map_err(refused),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    async fn approve_and_write(
+        &self,
+        peer: &Peer<RoleServer>,
+        change: config_edit::PreparedChange,
+    ) -> Result<String, ErrorData> {
+        approval::ask_then_commit(peer, &self.pending_changes, change)
+            .await
+            .map_err(failed)
+    }
 }
 
 #[tool_router]
@@ -584,26 +662,91 @@ impl UmbrielServer {
     }
 
     #[tool(
-        description = "Bind a key chord to an Umbriel action in the user's config, replacing any existing binding for it. The edited config is checked with `umbriel config validate` before saving, the previous config is backed up, and Umbriel applies it immediately. Use list_actions for valid actions."
+        description = "Bind a key chord to an Umbriel action in the user's config, replacing any existing binding for it. The change is checked with `umbriel config validate` and is only written after the user approves it and they choose whether to keep a backup. Use list_actions for valid actions.",
+        annotations(destructive_hint = true)
     )]
-    fn set_keybind(
+    async fn set_keybind(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(request): Parameters<KeybindRequest>,
     ) -> Result<String, ErrorData> {
         self.profile
             .permit_action("set_keybind", &request.action)
             .map_err(refused)?;
-        config_edit::set_keybind(&request.chord, &request.action, request.repeat).map_err(failed)
+        match config_edit::prepare_set_keybind(&request.chord, &request.action, request.repeat)
+            .map_err(failed)?
+        {
+            Some(change) => self.approve_and_write(&peer, change).await,
+            None => Ok(format!(
+                "{} is already bound to {}; nothing changed",
+                request.chord.trim(),
+                request.action.trim()
+            )),
+        }
     }
 
     #[tool(
-        description = "Remove a key chord's binding from the user's Umbriel config. The previous config is backed up and Umbriel applies the change immediately."
+        description = "Remove a key chord's binding from the user's Umbriel config. Only written after the user approves it, and they choose whether to keep a backup.",
+        annotations(destructive_hint = true)
     )]
-    fn remove_keybind(
+    async fn remove_keybind(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(request): Parameters<KeybindChord>,
     ) -> Result<String, ErrorData> {
-        config_edit::remove_keybind(&request.chord).map_err(failed)
+        let change = config_edit::prepare_remove_keybind(&request.chord).map_err(failed)?;
+        self.approve_and_write(&peer, change).await
+    }
+
+    #[tool(
+        description = "Change one Umbriel setting in the user's config, such as \"layout.gap\" to 12 or \"appearance.blur.enabled\" to false. Keys and values are checked against Umbriel's schema (see config_options) and with `umbriel config validate`; the change is only written after the user approves it, and they choose whether to keep a backup. Not for keybinds or rule lists.",
+        annotations(destructive_hint = true)
+    )]
+    async fn set_option(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<OptionChange>,
+    ) -> Result<String, ErrorData> {
+        self.permit_setting("set_option", &request.key, Some(&request.value))?;
+        match setting::prepare_set_option(&request.key, &request.value).map_err(failed)? {
+            Some(change) => self.approve_and_write(&peer, change).await,
+            None => Ok(format!(
+                "{} already has that value; nothing changed",
+                request.key.trim()
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Remove one setting from the user's Umbriel config so Umbriel uses its default again. Only written after the user approves it, and they choose whether to keep a backup.",
+        annotations(destructive_hint = true)
+    )]
+    async fn reset_option(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<OptionKey>,
+    ) -> Result<String, ErrorData> {
+        self.permit_setting("reset_option", &request.key, None)?;
+        let change = setting::prepare_reset_option(&request.key).map_err(failed)?;
+        self.approve_and_write(&peer, change).await
+    }
+
+    #[tool(
+        description = "Write a config change that the user has explicitly approved, using the confirmation code a config tool returned. Only call this after showing the user the change and getting their yes; never approve on their behalf.",
+        annotations(destructive_hint = true)
+    )]
+    fn apply_config_change(
+        &self,
+        Parameters(request): Parameters<ConfirmationCode>,
+    ) -> Result<String, ErrorData> {
+        let change = self
+            .pending_changes
+            .take(&request.confirmation)
+            .map_err(failed)?;
+        let keep_backup = request
+            .backup
+            .unwrap_or_else(approval::keep_backup_unless_told_otherwise);
+        config_edit::commit(&change, keep_backup).map_err(failed)
     }
 
     #[tool(description = "Read the current clipboard contents.")]
@@ -626,7 +769,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change keybinds with set_keybind and remove_keybind rather than editing the config file directly."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, and keybinds with set_keybind and remove_keybind, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(
@@ -673,11 +816,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
         None => {}
     }
-    let service = UmbrielServer {
-        profile: cli.profile,
-    }
-    .serve(stdio())
-    .await?;
+    let service = UmbrielServer::new(cli.profile).serve(stdio()).await?;
     service.waiting().await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -691,12 +830,10 @@ mod tests {
 
     #[test]
     fn the_registration_summary_is_the_first_line_of_the_server_instructions() {
-        let instructions = UmbrielServer {
-            profile: crate::profile::Profile::Full,
-        }
-        .get_info()
-        .instructions
-        .expect("server instructions");
+        let instructions = UmbrielServer::new(crate::profile::Profile::Full)
+            .get_info()
+            .instructions
+            .expect("server instructions");
 
         assert_eq!(instructions.lines().next(), Some(SERVER_SUMMARY));
     }

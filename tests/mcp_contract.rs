@@ -115,6 +115,9 @@ struct McpProcess {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     next_id: u64,
+    approval_reply: Option<Value>,
+    approval_questions: Vec<String>,
+    approval_forms: Vec<Value>,
 }
 
 impl McpProcess {
@@ -135,6 +138,16 @@ impl McpProcess {
         args: &[&str],
         environment: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
+        Self::start_as_client(socket_path, args, environment, json!({}), None)
+    }
+
+    fn start_as_client(
+        socket_path: &std::path::Path,
+        args: &[&str],
+        environment: &[(&str, &std::ffi::OsStr)],
+        capabilities: Value,
+        approval_reply: Option<Value>,
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
             .args(args)
             .envs(environment.iter().copied())
@@ -151,13 +164,16 @@ impl McpProcess {
             input,
             output,
             next_id: 1,
+            approval_reply,
+            approval_questions: Vec::new(),
+            approval_forms: Vec::new(),
         };
 
         let initialized = process.request(
             "initialize",
             json!({
                 "protocolVersion": "2025-06-18",
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": { "name": "contract-test", "version": "1" }
             }),
         );
@@ -184,10 +200,38 @@ impl McpProcess {
             self.output.read_line(&mut line).expect("read MCP response");
             assert!(!line.is_empty(), "MCP server closed stdout unexpectedly");
             let response: Value = serde_json::from_str(&line).expect("MCP response JSON");
+            if response.get("method").is_some() {
+                self.answer_server_request(&response);
+                continue;
+            }
             if response.get("id").and_then(Value::as_u64) == Some(id) {
                 return response;
             }
         }
+    }
+
+    fn answer_server_request(&mut self, request: &Value) {
+        let Some(request_id) = request.get("id") else {
+            return;
+        };
+        let result = if request["method"] == "elicitation/create" {
+            self.approval_forms
+                .push(request["params"]["requestedSchema"].clone());
+            self.approval_questions.push(
+                request["params"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            self.approval_reply
+                .clone()
+                .unwrap_or_else(|| json!({"action": "cancel"}))
+        } else {
+            json!({})
+        };
+        let message = json!({"jsonrpc":"2.0", "id": request_id, "result": result});
+        writeln!(self.input, "{message}").expect("answer server request");
+        self.input.flush().expect("flush answer");
     }
 
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
@@ -970,7 +1014,7 @@ Workspaces
   workspace-next               Switch to the next workspace
 HELP
   ;;
-  "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true}]}' ;;
+  "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout","type":"table"},{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true},{"path":"general.autostart","type":"string_array","default":[]},{"path":"hot_corners.top_left.action","type":"string","format":"action"},{"path":"output.<name>.enabled","type":"bool","default":true},{"path":"input.keyboard.layout","type":"string","default":""},{"path":"keybinds.<name>","type":"string_or_table","format":"action"},{"path":"window_rule","type":"array_of_tables"}]}' ;;
   "config validate -c "*)
     if grep -q "no-such-action" "$4"; then
       printf '12:00:00.000 [\033[33mWRN\033[0m] [config] %s:3:1: ignoring keybind\n' "$4"
@@ -1151,7 +1195,8 @@ fn set_keybind_adds_a_validated_binding_and_backs_up_the_old_config() {
     let home = home_with_config(KEYBIND_CONFIG);
     let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
 
-    let response = server.call_tool(
+    let response = call_and_approve(
+        &mut server,
         "set_keybind",
         json!({"chord":"Mod+F","action":"window-toggle-fullscreen"}),
     );
@@ -1182,13 +1227,14 @@ fn rebinding_reports_what_the_chord_did_before() {
     let home = home_with_config(KEYBIND_CONFIG);
     let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
 
-    let report = text_content(&server.call_tool(
+    let report = text_content(&call_and_approve(
+        &mut server,
         "set_keybind",
         json!({"chord":"mod+q","action":"window-kill"}),
     ));
 
     assert!(
-        report.contains("Bound Mod+Q to window-kill (was window-close)"),
+        report.contains("Applied: Bind Mod+Q to window-kill (was window-close)"),
         "{report}"
     );
     let config = std::fs::read_to_string(config_file(&home)).unwrap();
@@ -1231,11 +1277,15 @@ fn remove_keybind_drops_the_binding_and_reports_it() {
     let home = home_with_config(KEYBIND_CONFIG);
     let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
 
-    let report = text_content(&server.call_tool("remove_keybind", json!({"chord":"Mod+T"})));
-    let missing = server.call_tool("remove_keybind", json!({"chord":"Mod+Z"}));
+    let report = text_content(&call_and_approve(
+        &mut server,
+        "remove_keybind",
+        json!({"chord":"Mod+T"}),
+    ));
+    let missing = call_and_approve(&mut server, "remove_keybind", json!({"chord":"Mod+Z"}));
 
     assert!(
-        report.contains("Removed the binding for Mod+T (was spawn:kitty)"),
+        report.contains("Applied: Remove the binding for Mod+T (was spawn:kitty)"),
         "{report}"
     );
     assert!(
@@ -1301,7 +1351,8 @@ fn a_symlinked_config_stays_a_symlink_and_its_target_is_edited() {
     std::os::unix::fs::symlink(dotfiles.join("umbriel.toml"), config_file(&home)).unwrap();
     let (_fake, mut server) = start_with_umbriel_cli(&home, "full");
 
-    let response = server.call_tool(
+    let response = call_and_approve(
+        &mut server,
         "set_keybind",
         json!({"chord":"Mod+F","action":"window-close"}),
     );
@@ -1375,7 +1426,11 @@ fn quick_successive_edits_each_keep_their_own_backup() {
         ("Mod+G", "window-kill"),
         ("Mod+H", "window-close"),
     ] {
-        let response = server.call_tool("set_keybind", json!({"chord":chord,"action":action}));
+        let response = call_and_approve(
+            &mut server,
+            "set_keybind",
+            json!({"chord":chord,"action":action}),
+        );
         assert!(response.get("result").is_some(), "{response}");
     }
 
@@ -1409,4 +1464,386 @@ fn the_server_reports_the_crate_version() {
         initialized["result"]["serverInfo"]["version"],
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn confirmation_code(response: &Value) -> Option<String> {
+    let text = response["result"]["content"][0]["text"].as_str()?;
+    let after = text.split("confirmation \"").nth(1)?;
+    Some(after.split('"').next()?.to_owned())
+}
+
+fn call_and_approve(server: &mut McpProcess, tool: &str, arguments: Value) -> Value {
+    let previewed = server.call_tool(tool, arguments);
+    match confirmation_code(&previewed) {
+        Some(code) => server.call_tool("apply_config_change", json!({"confirmation": code})),
+        None => previewed,
+    }
+}
+
+fn start_editor(
+    home: &std::path::Path,
+    profile: &str,
+    outputs: Value,
+    approval_reply: Option<Value>,
+) -> (FakeUmbriel, McpProcess) {
+    let mut replies = compositor_state_replies();
+    replies.insert("outputs".to_string(), json!({ "ok": outputs }));
+    let fake = FakeUmbriel::start(replies);
+    let tools = fake_tools_directory(None, None);
+    fake_umbriel_cli(&tools);
+    let path = format!("{}:/usr/bin", tools.display());
+    let capabilities = if approval_reply.is_some() {
+        json!({"elicitation": {}})
+    } else {
+        json!({})
+    };
+    let server = McpProcess::start_as_client(
+        &fake.path,
+        &["--profile", profile],
+        &[
+            ("PATH", path.as_ref()),
+            ("HOME", home.as_os_str()),
+            ("XDG_CONFIG_HOME", std::ffi::OsStr::new("")),
+        ],
+        capabilities,
+        approval_reply,
+    );
+    (fake, server)
+}
+
+fn two_outputs() -> Value {
+    json!([{"name": "HDMI-A-1", "enabled": true}, {"name": "DP-1", "enabled": true}])
+}
+
+fn current_config(home: &std::path::Path) -> String {
+    std::fs::read_to_string(config_file(home)).unwrap()
+}
+
+#[test]
+fn without_a_dialog_nothing_is_written_until_the_confirmation_code_is_used() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+
+    let preview = text_content(&previewed);
+    assert!(
+        preview.contains("Nothing has been written yet"),
+        "{preview}"
+    );
+    assert!(
+        preview.contains("Set layout.gap to 12 (was 4)"),
+        "{preview}"
+    );
+    assert!(preview.contains("+ gap = 12"), "{preview}");
+    assert_eq!(current_config(&home), KEYBIND_CONFIG);
+    assert_eq!(files_beside_config(&home), vec!["config.toml"]);
+
+    let code = confirmation_code(&previewed).expect("confirmation code");
+    let applied = server.call_tool("apply_config_change", json!({"confirmation": code}));
+    assert!(
+        text_content(&applied).contains("Applied: Set layout.gap to 12"),
+        "{applied}"
+    );
+    assert!(current_config(&home).contains("gap = 12"));
+
+    let reused = server.call_tool("apply_config_change", json!({"confirmation": code}));
+    assert!(
+        error_message(&reused).contains("no change is waiting"),
+        "{reused}"
+    );
+    let invented = server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": "123456789abc"}),
+    );
+    assert!(
+        error_message(&invented).contains("no change is waiting"),
+        "{invented}"
+    );
+}
+
+#[test]
+fn a_change_previewed_against_an_older_file_is_not_written() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    std::fs::write(
+        config_file(&home),
+        format!("{KEYBIND_CONFIG}# edited by hand\n"),
+    )
+    .unwrap();
+    let applied = server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": confirmation_code(&previewed).unwrap()}),
+    );
+
+    assert!(
+        error_message(&applied).contains("changed after this change was previewed"),
+        "{applied}"
+    );
+    assert!(!current_config(&home).contains("gap = 12"));
+}
+
+#[test]
+fn a_client_dialog_writes_only_when_the_user_approves() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let approve = json!({"action": "accept", "content": {"apply": true}});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    let response = server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-close"}),
+    );
+
+    assert!(
+        text_content(&response).contains("Applied: Bind Mod+F to window-close"),
+        "{response}"
+    );
+    assert!(
+        confirmation_code(&response).is_none(),
+        "a dialog needs no code"
+    );
+    assert!(current_config(&home).contains("\"Mod+F\" = \"window-close\""));
+    assert_eq!(server.approval_questions.len(), 1);
+    assert!(
+        server.approval_questions[0].contains("+ \"Mod+F\" = \"window-close\""),
+        "{:?}",
+        server.approval_questions
+    );
+}
+
+#[test]
+fn declining_or_unticking_in_the_dialog_writes_nothing() {
+    for reply in [
+        json!({"action": "decline"}),
+        json!({"action": "cancel"}),
+        json!({"action": "accept", "content": {"apply": false}}),
+    ] {
+        let home = home_with_config(KEYBIND_CONFIG);
+        let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(reply.clone()));
+
+        let response = server.call_tool("set_option", json!({"key":"layout.gap","value":20}));
+
+        assert!(
+            text_content(&response).contains("did not approve"),
+            "{reply}: {response}"
+        );
+        assert_eq!(current_config(&home), KEYBIND_CONFIG, "{reply}");
+        assert_eq!(files_beside_config(&home), vec!["config.toml"], "{reply}");
+    }
+}
+
+#[test]
+fn set_option_checks_keys_and_values_before_asking() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let error = |server: &mut McpProcess, key: &str, value: Value| {
+        error_message(&server.call_tool("set_option", json!({"key": key, "value": value})))
+    };
+
+    assert!(error(&mut server, "layout.gap", json!(9000)).contains("between 0 and 500"));
+    assert!(error(&mut server, "layout.gaps", json!(1)).contains("not an Umbriel setting"));
+    assert!(error(&mut server, "keybinds.Mod+T", json!("window-close")).contains("set_keybind"));
+    assert!(error(&mut server, "window_rule", json!({})).contains("rule list"));
+    assert_eq!(current_config(&home), KEYBIND_CONFIG);
+}
+
+#[test]
+fn reset_option_removes_a_setting_after_approval() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let applied = call_and_approve(&mut server, "reset_option", json!({"key":"layout.gap"}));
+
+    assert!(
+        text_content(&applied).contains("Reset layout.gap to Umbriel's default (8) (was 4)"),
+        "{applied}"
+    );
+    assert!(!current_config(&home).contains("gap ="));
+}
+
+#[test]
+fn no_exec_refuses_settings_that_run_programs_or_spawn_actions() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "no-exec", two_outputs(), None);
+
+    let autostart = server.call_tool(
+        "set_option",
+        json!({"key":"general.autostart","value":["sh"]}),
+    );
+    let corner_spawn = server.call_tool(
+        "set_option",
+        json!({"key":"hot_corners.top_left.action","value":"spawn:foot"}),
+    );
+    let corner_overview = server.call_tool(
+        "set_option",
+        json!({"key":"hot_corners.top_left.action","value":"overview-toggle"}),
+    );
+    let reset_autostart = server.call_tool("reset_option", json!({"key":"general.autostart"}));
+
+    assert_refused_by_profile(&autostart, "no-exec");
+    assert_refused_by_profile(&corner_spawn, "no-exec");
+    assert!(
+        confirmation_code(&corner_overview).is_some(),
+        "{corner_overview}"
+    );
+    assert!(
+        confirmation_code(&reset_autostart).is_some(),
+        "removing autostart grants nothing, so no-exec may preview it: {reset_autostart}"
+    );
+}
+
+#[test]
+fn read_only_refuses_every_config_write_tool() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "read-only", two_outputs(), None);
+
+    for (tool, arguments) in [
+        ("set_option", json!({"key":"layout.gap","value":12})),
+        ("reset_option", json!({"key":"layout.gap"})),
+        (
+            "apply_config_change",
+            json!({"confirmation":"123456789abc"}),
+        ),
+    ] {
+        assert_refused_by_profile(&server.call_tool(tool, arguments), "read-only");
+    }
+}
+
+#[test]
+fn disabling_the_only_enabled_output_is_refused() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let only_dp =
+        json!([{"name": "DP-1", "enabled": true}, {"name": "HDMI-A-1", "enabled": false}]);
+    let (_fake, mut server) = start_editor(&home, "full", only_dp, None);
+
+    let last = server.call_tool(
+        "set_option",
+        json!({"key":"output.DP-1.enabled","value":false}),
+    );
+    let other = server.call_tool(
+        "set_option",
+        json!({"key":"output.HDMI-A-1.enabled","value":false}),
+    );
+
+    assert!(error_message(&last).contains("without a screen"), "{last}");
+    assert!(confirmation_code(&other).is_some(), "{other}");
+}
+
+#[test]
+fn a_keyboard_layout_change_carries_a_caution() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool(
+        "set_option",
+        json!({"key":"input.keyboard.layout","value":"de"}),
+    );
+
+    assert!(
+        text_content(&previewed).contains("Caution: a wrong keyboard setting"),
+        "{previewed}"
+    );
+}
+
+#[test]
+fn every_config_write_tool_is_marked_destructive() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let tools = server.request("tools/list", json!({}));
+    for name in [
+        "set_option",
+        "reset_option",
+        "set_keybind",
+        "remove_keybind",
+        "apply_config_change",
+    ] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(tool["annotations"]["destructiveHint"], true, "{name}");
+    }
+}
+
+fn backups(home: &std::path::Path) -> usize {
+    files_beside_config(home)
+        .iter()
+        .filter(|name| name.starts_with("config.toml.bak-"))
+        .count()
+}
+
+#[test]
+fn the_dialog_asks_whether_to_keep_a_backup_and_defaults_to_yes() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let approve = json!({"action": "accept", "content": {"apply": true}});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    let response = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+
+    let backup_field = &server.approval_forms[0]["properties"]["backup"];
+    assert_eq!(
+        backup_field["type"], "boolean",
+        "{:?}",
+        server.approval_forms
+    );
+    assert_eq!(backup_field["default"], true, "{:?}", server.approval_forms);
+    assert_eq!(
+        backups(&home),
+        1,
+        "an unanswered backup question keeps the backup"
+    );
+    assert!(
+        text_content(&response).contains("Backup of the previous config"),
+        "{response}"
+    );
+}
+
+#[test]
+fn unticking_backup_in_the_dialog_writes_the_change_without_a_backup() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let approve = json!({"action": "accept", "content": {"apply": true, "backup": false}});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    let response = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+
+    assert!(current_config(&home).contains("gap = 12"));
+    assert_eq!(backups(&home), 0, "{:?}", files_beside_config(&home));
+    assert!(
+        text_content(&response).contains("No backup was kept"),
+        "{response}"
+    );
+}
+
+#[test]
+fn the_code_path_asks_about_the_backup_too() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let first = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    assert!(
+        text_content(&first).contains("whether they want a backup"),
+        "{first}"
+    );
+    let without = server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": confirmation_code(&first).unwrap(), "backup": false}),
+    );
+    assert!(
+        text_content(&without).contains("No backup was kept"),
+        "{without}"
+    );
+    assert_eq!(backups(&home), 0);
+
+    let second = server.call_tool("set_option", json!({"key":"layout.gap","value":14}));
+    server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": confirmation_code(&second).unwrap()}),
+    );
+    assert_eq!(backups(&home), 1, "omitting the answer keeps a backup");
 }
