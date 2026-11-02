@@ -1,4 +1,5 @@
 mod approval;
+mod capture_target;
 mod compositor;
 mod config_edit;
 mod doctor;
@@ -6,11 +7,13 @@ mod input;
 mod ipc;
 mod keyboard;
 mod profile;
+mod recording;
 mod register;
 mod screen;
 mod setting;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
+use capture_target::{CaptureTarget, Purpose};
 use clap::Parser;
 use profile::Profile;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -162,6 +165,27 @@ struct CaptureRequest {
     window_id: Option<String>,
     /// Downscale so the image is at most this wide
     max_width: Option<u32>,
+    /// True only when the user asked for this screenshot without saying what to capture: they
+    /// then choose the whole screen, a monitor or a window. Leave false when you capture for your
+    /// own purposes, so you are never kept waiting.
+    ask_user_what_to_capture: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RecordingRequest {
+    /// Record this whole output, such as "DP-1"
+    output: Option<String>,
+    /// Record the screen area of this window; it must be on screen
+    window_id: Option<String>,
+    /// True only when the user asked for this recording without saying what to record: they then
+    /// choose a monitor or a window. Leave false when you start a recording yourself, so you are
+    /// never kept waiting.
+    ask_user_what_to_capture: Option<bool>,
+    /// Also record audio (default false)
+    audio: Option<bool>,
+    /// Stop automatically after this many seconds, 1 to 3600 (default 30). Pass the length the
+    /// user asked for, if any.
+    duration_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -244,6 +268,66 @@ struct LayoutRequest {
 struct UmbrielServer {
     profile: Profile,
     pending_changes: Arc<approval::PendingChanges>,
+    recorder: Arc<recording::Recorder>,
+}
+
+enum Chosen {
+    Target {
+        output: Option<String>,
+        window_id: Option<String>,
+        seconds: Option<u32>,
+    },
+    Nothing(String),
+}
+
+fn listed(command: &str) -> Vec<serde_json::Value> {
+    ipc::query(command)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn focused_or_first_output() -> anyhow::Result<String> {
+    let outputs = listed("outputs");
+    let enabled = || {
+        outputs.iter().filter(|output| {
+            output.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
+        })
+    };
+    enabled()
+        .find(|output| output.get("focused").and_then(serde_json::Value::as_bool) == Some(true))
+        .or_else(|| enabled().next())
+        .and_then(|output| output.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Umbriel reports no enabled output to record"))
+}
+
+fn recording_area(
+    output: Option<String>,
+    window_id: Option<String>,
+) -> anyhow::Result<(capture_target::RecordingArea, String)> {
+    if let Some(id) = window_id {
+        let placement = ipc::window_placement(&id)?;
+        if !placement.shown_on_screen {
+            return Err(anyhow::anyhow!(
+                "window {id} is not on screen; a recording captures a screen area, so switch to \
+                 its workspace first or record a monitor"
+            ));
+        }
+        let description = format!("the screen area of window {id} ({})", placement.geometry);
+        return Ok((
+            capture_target::RecordingArea::Region {
+                geometry: placement.geometry,
+            },
+            description,
+        ));
+    }
+    let name = match output {
+        Some(name) => name,
+        None => focused_or_first_output()?,
+    };
+    let description = format!("monitor {name}");
+    Ok((capture_target::RecordingArea::Output(name), description))
 }
 
 impl UmbrielServer {
@@ -251,6 +335,68 @@ impl UmbrielServer {
         Self {
             profile,
             pending_changes: Arc::default(),
+            recorder: Arc::default(),
+        }
+    }
+
+    async fn choose_target(
+        &self,
+        peer: &Peer<RoleServer>,
+        output: &Option<String>,
+        window_id: &Option<String>,
+        ask_user: Option<bool>,
+        purpose: Purpose,
+        seconds: Option<u32>,
+    ) -> Result<Chosen, ErrorData> {
+        let already_chosen = output.is_some() || window_id.is_some();
+        if already_chosen || ask_user != Some(true) {
+            return Ok(Chosen::Target {
+                output: output.clone(),
+                window_id: window_id.clone(),
+                seconds,
+            });
+        }
+        let ask_length = purpose == Purpose::Recording && seconds.is_none();
+        let choices =
+            capture_target::capture_choices(&listed("outputs"), &listed("windows"), purpose);
+        match approval::ask_what_to_capture(peer, purpose, &choices, ask_length)
+            .await
+            .map_err(failed)?
+        {
+            approval::CaptureAnswer::Chosen {
+                target,
+                seconds: chosen_seconds,
+            } => {
+                let seconds = seconds.or(chosen_seconds);
+                let (output, window_id) = match target {
+                    CaptureTarget::WholeScreen => (None, None),
+                    CaptureTarget::Output(name) => (Some(name), None),
+                    CaptureTarget::Window(id) => (None, Some(id)),
+                };
+                Ok(Chosen::Target {
+                    output,
+                    window_id,
+                    seconds,
+                })
+            }
+            approval::CaptureAnswer::NotChosen(message) => Ok(Chosen::Nothing(message)),
+            approval::CaptureAnswer::NoDialog => {
+                let length_question = if ask_length {
+                    format!(
+                        " Also ask how long to record (default {}) and pass it as \
+                         duration_seconds.",
+                        capture_target::human_duration(capture_target::DEFAULT_RECORDING_SECONDS)
+                    )
+                } else {
+                    String::new()
+                };
+                Ok(Chosen::Nothing(format!(
+                    "Nothing was captured yet. This client cannot ask the user directly, so ask \
+                     them what to capture, then call this tool again with their choice and \
+                     ask_user_what_to_capture unset.{length_question}\n{}",
+                    capture_target::choices_for_the_model(&choices)
+                )))
+            }
         }
     }
 
@@ -536,15 +682,34 @@ impl UmbrielServer {
     }
 
     #[tool(
-        description = "Capture the screen, one output, or one window as a downscaled image. A window_id captures that window even on a hidden workspace, without switching to it."
+        description = "Capture the screen, one output, or one window as a downscaled image. A window_id captures that window even on a hidden workspace, without switching to it. When the user asks for a screenshot without saying what to capture, set ask_user_what_to_capture so they choose; when you capture for yourself, leave it unset."
     )]
-    fn screenshot(
+    async fn screenshot(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(request): Parameters<CaptureRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        let (output, window_id) = match self
+            .choose_target(
+                &peer,
+                &request.output,
+                &request.window_id,
+                request.ask_user_what_to_capture,
+                Purpose::Screenshot,
+                None,
+            )
+            .await?
+        {
+            Chosen::Target {
+                output, window_id, ..
+            } => (output, window_id),
+            Chosen::Nothing(message) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
+            }
+        };
         let shot = screen::capture(
-            request.output.as_deref(),
-            request.window_id.as_deref(),
+            output.as_deref(),
+            window_id.as_deref(),
             request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH),
         )
         .map_err(failed)?;
@@ -555,15 +720,34 @@ impl UmbrielServer {
     }
 
     #[tool(
-        description = "Capture the screen, one output, or one window and return the text found in it by OCR. A window_id reads that window even on a hidden workspace, without switching to it."
+        description = "Capture the screen, one output, or one window and return the text found in it by OCR. A window_id reads that window even on a hidden workspace, without switching to it. When the user asks for this without saying what to capture, set ask_user_what_to_capture so they choose; when you capture for yourself, leave it unset."
     )]
-    fn screenshot_with_ocr(
+    async fn screenshot_with_ocr(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(request): Parameters<CaptureRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        let (output, window_id) = match self
+            .choose_target(
+                &peer,
+                &request.output,
+                &request.window_id,
+                request.ask_user_what_to_capture,
+                Purpose::Screenshot,
+                None,
+            )
+            .await?
+        {
+            Chosen::Target {
+                output, window_id, ..
+            } => (output, window_id),
+            Chosen::Nothing(message) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
+            }
+        };
         let shot = screen::capture(
-            request.output.as_deref(),
-            request.window_id.as_deref(),
+            output.as_deref(),
+            window_id.as_deref(),
             request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH),
         )
         .map_err(failed)?;
@@ -749,6 +933,82 @@ impl UmbrielServer {
         config_edit::commit(&change, keep_backup).map_err(failed)
     }
 
+    #[tool(
+        description = "Start recording a video of one monitor or one on-screen window to a file in the user's Videos folder. When the user asks for a recording without saying what to record, set ask_user_what_to_capture so they choose; when you start one yourself, give output or window_id, or leave both unset for the focused monitor. Stops by itself after duration_seconds (default 30); stop sooner with stop_recording."
+    )]
+    async fn start_recording(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<RecordingRequest>,
+    ) -> Result<String, ErrorData> {
+        let longest = capture_target::LONGEST_RECORDING_SECONDS;
+        if let Some(seconds) = request.duration_seconds
+            && !(1..=longest).contains(&seconds)
+        {
+            return Err(ErrorData::invalid_params(
+                format!("duration_seconds must be between 1 and {longest}"),
+                None,
+            ));
+        }
+        let (output, window_id, seconds) = match self
+            .choose_target(
+                &peer,
+                &request.output,
+                &request.window_id,
+                request.ask_user_what_to_capture,
+                Purpose::Recording,
+                request.duration_seconds,
+            )
+            .await?
+        {
+            Chosen::Target {
+                output,
+                window_id,
+                seconds,
+            } => (
+                output,
+                window_id,
+                seconds.unwrap_or(capture_target::DEFAULT_RECORDING_SECONDS),
+            ),
+            Chosen::Nothing(message) => return Ok(message),
+        };
+        let (area, description) = recording_area(output, window_id).map_err(failed)?;
+        let recorder = Arc::clone(&self.recorder);
+        let audio = request.audio.unwrap_or(false);
+        let started_description = description.clone();
+        let started =
+            tokio::task::spawn_blocking(move || recorder.start(area, started_description, audio))
+                .await
+                .map_err(|error| failed(anyhow::anyhow!("the recorder task failed: {error}")))?
+                .map_err(failed)?;
+        let recorder = Arc::clone(&self.recorder);
+        let id = started.id;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(seconds))).await;
+            let _ = tokio::task::spawn_blocking(move || recorder.stop_at_time_limit(id)).await;
+        });
+        let audio_note = if audio {
+            " with audio"
+        } else {
+            " without audio"
+        };
+        Ok(format!(
+            "Recording {description}{audio_note} to {}. It stops by itself after {}; call \
+             stop_recording to stop sooner.",
+            started.file.display(),
+            capture_target::human_duration(seconds)
+        ))
+    }
+
+    #[tool(description = "Stop the current screen recording and report where the video was saved.")]
+    async fn stop_recording(&self) -> Result<String, ErrorData> {
+        let recorder = Arc::clone(&self.recorder);
+        tokio::task::spawn_blocking(move || recorder.stop())
+            .await
+            .map_err(|error| failed(anyhow::anyhow!("the recorder task failed: {error}")))?
+            .map_err(failed)
+    }
+
     #[tool(description = "Read the current clipboard contents.")]
     fn clipboard_read(&self) -> Result<String, ErrorData> {
         input::clipboard_read().map_err(failed)
@@ -769,7 +1029,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, and keybinds with set_keybind and remove_keybind, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, and keybinds with set_keybind and remove_keybind, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(

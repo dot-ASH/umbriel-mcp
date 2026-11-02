@@ -1,5 +1,10 @@
+use crate::capture_target::{
+    CaptureTarget, Choice, DEFAULT_RECORDING_SECONDS, Purpose, RECORDING_LENGTHS, human_duration,
+    parse_choice,
+};
 use crate::config_edit::{PreparedChange, commit};
 use anyhow::{Result, anyhow};
+use rmcp::model::{ElicitRequestParams, ElicitationAction, ElicitationSchema, EnumSchema};
 use rmcp::service::{ElicitationError, ElicitationMode, ServiceError};
 use rmcp::{Peer, RoleServer, schemars};
 use serde::Deserialize;
@@ -130,5 +135,108 @@ pub async fn ask_then_commit(
         Err(error) => Err(anyhow!(
             "could not ask the user to approve the change ({error}); nothing was written"
         )),
+    }
+}
+
+pub const CHOICE_WINDOW: Duration = Duration::from_secs(300);
+
+pub enum CaptureAnswer {
+    Chosen {
+        target: CaptureTarget,
+        seconds: Option<u32>,
+    },
+    NotChosen(String),
+    NoDialog,
+}
+
+fn form_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("could not build the capture choices: {error}")
+}
+
+fn length_choices() -> Result<EnumSchema> {
+    let values = RECORDING_LENGTHS.iter().map(u32::to_string).collect();
+    let titles = RECORDING_LENGTHS
+        .iter()
+        .map(|seconds| human_duration(*seconds))
+        .collect();
+    Ok(EnumSchema::builder(values)
+        .enum_titles(titles)
+        .map_err(form_error)?
+        .with_default(DEFAULT_RECORDING_SECONDS.to_string())
+        .map_err(form_error)?
+        .build())
+}
+
+fn choice_form(choices: &[Choice], ask_length: bool) -> Result<ElicitationSchema> {
+    let values = choices.iter().map(|choice| choice.value.clone()).collect();
+    let titles = choices.iter().map(|choice| choice.title.clone()).collect();
+    let target = EnumSchema::builder(values)
+        .enum_titles(titles)
+        .map_err(form_error)?
+        .build();
+    let mut form = ElicitationSchema::builder().required_enum_schema("target", target);
+    if ask_length {
+        form = form.required_enum_schema("duration", length_choices()?);
+    }
+    form.build().map_err(form_error)
+}
+
+pub async fn ask_what_to_capture(
+    peer: &Peer<RoleServer>,
+    purpose: Purpose,
+    choices: &[Choice],
+    ask_length: bool,
+) -> Result<CaptureAnswer> {
+    if !peer
+        .supported_elicitation_modes()
+        .contains(&ElicitationMode::Form)
+    {
+        return Ok(CaptureAnswer::NoDialog);
+    }
+    if choices.is_empty() {
+        return Err(anyhow!("there is nothing on this desktop to capture"));
+    }
+    let message = match purpose {
+        Purpose::Screenshot => "What should the screenshot show?",
+        Purpose::Recording => "What should be recorded?",
+    };
+    let request = ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message: message.to_owned(),
+        requested_schema: choice_form(choices, ask_length)?,
+    };
+    let nothing = |reason: &str| {
+        Ok(CaptureAnswer::NotChosen(format!(
+            "{reason}, so nothing was captured."
+        )))
+    };
+    match peer
+        .create_elicitation_with_timeout(request, Some(CHOICE_WINDOW))
+        .await
+    {
+        Ok(answer) if answer.action == ElicitationAction::Accept => {
+            let field = |name: &str| {
+                answer
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get(name))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            let seconds = field("duration").and_then(|seconds| seconds.parse().ok());
+            match field("target") {
+                Some(value) => Ok(CaptureAnswer::Chosen {
+                    target: parse_choice(&value)?,
+                    seconds,
+                }),
+                None => nothing("The user did not pick anything"),
+            }
+        }
+        Ok(_) => nothing("The user did not choose what to capture"),
+        Err(ServiceError::Timeout { .. }) => nothing(&format!(
+            "The user did not answer within {} minutes",
+            CHOICE_WINDOW.as_secs() / 60
+        )),
+        Err(error) => Err(anyhow!("could not ask the user what to capture ({error})")),
     }
 }

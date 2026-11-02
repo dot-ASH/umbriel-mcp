@@ -13,7 +13,8 @@ conflicts=("$_binary")
 optdepends=('umbriel-git: the compositor this server controls'
             'grim: screen capture'
             'tesseract: OCR tools'
-            'tesseract-data-eng: English OCR language data')
+            'tesseract-data-eng: English OCR language data'
+            'wf-recorder: screen recording')
 source_x86_64=("$_binary-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-x86_64-linux.tar.gz")
 source_aarch64=("$_binary-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-aarch64-linux.tar.gz")
 sha256sums_x86_64=('SKIP')

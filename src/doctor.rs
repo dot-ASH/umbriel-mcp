@@ -7,6 +7,7 @@ const SOCKET_CHECK: &str = "Umbriel socket";
 const POINTER_CHECK: &str = "Virtual pointer protocol";
 const KEYBOARD_CHECK: &str = "Virtual keyboard protocol";
 const GRIM_CHECK: &str = "Screen capture (grim)";
+const RECORDER_CHECK: &str = "Screen recording (wf-recorder)";
 const TESSERACT_CHECK: &str = "OCR (tesseract)";
 const ENGLISH_DATA_CHECK: &str = "OCR English data";
 
@@ -32,6 +33,7 @@ pub struct Facts {
     pub compositor_socket: Result<String, String>,
     pub protocols: Result<ProtocolGlobals, String>,
     pub grim_installed: bool,
+    pub recorder_installed: bool,
     pub tesseract_installed: bool,
     pub tesseract_languages: Option<Vec<String>>,
     pub distribution: Distribution,
@@ -110,6 +112,7 @@ enum Prerequisite {
     Grim,
     Tesseract,
     EnglishData,
+    Recorder,
 }
 
 struct PackageNames {
@@ -117,6 +120,7 @@ struct PackageNames {
     grim: &'static str,
     tesseract: &'static str,
     english_data: &'static str,
+    recorder: &'static str,
 }
 
 impl PackageNames {
@@ -127,18 +131,21 @@ impl PackageNames {
                 grim: "grim",
                 tesseract: "tesseract",
                 english_data: "tesseract-data-eng",
+                recorder: "wf-recorder",
             }),
             Distribution::Debian => Some(Self {
                 install_command: "sudo apt install",
                 grim: "grim",
                 tesseract: "tesseract-ocr",
                 english_data: "tesseract-ocr-eng",
+                recorder: "wf-recorder",
             }),
             Distribution::Fedora => Some(Self {
                 install_command: "sudo dnf install",
                 grim: "grim",
                 tesseract: "tesseract",
                 english_data: "tesseract-langpack-eng",
+                recorder: "wf-recorder",
             }),
             Distribution::Unknown => None,
         }
@@ -149,6 +156,7 @@ impl PackageNames {
             Prerequisite::Grim => self.grim,
             Prerequisite::Tesseract => self.tesseract,
             Prerequisite::EnglishData => self.english_data,
+            Prerequisite::Recorder => self.recorder,
         };
         format!("{} {package}", self.install_command)
     }
@@ -164,6 +172,9 @@ fn generic_installation_advice(prerequisite: Prerequisite) -> &'static str {
         }
         Prerequisite::EnglishData => {
             "Install Tesseract's English language data (eng.traineddata) using your distribution's package manager, or place the file in Tesseract's tessdata directory."
+        }
+        Prerequisite::Recorder => {
+            "Install wf-recorder, the Wayland screen recorder, using your distribution's package manager, and make sure it is on PATH."
         }
     }
 }
@@ -283,6 +294,13 @@ pub fn diagnose(facts: &Facts) -> Vec<Check> {
             Prerequisite::Tesseract,
         ),
         english_data_check(facts),
+        program_check(
+            RECORDER_CHECK,
+            "wf-recorder",
+            facts.recorder_installed,
+            facts.distribution,
+            Prerequisite::Recorder,
+        ),
     ]
 }
 
@@ -364,6 +382,7 @@ fn gather_facts() -> Facts {
         compositor_socket: compositor_socket_fact(),
         protocols: protocol_fact(),
         grim_installed: is_on_path("grim"),
+        recorder_installed: is_on_path("wf-recorder"),
         tesseract_installed,
         tesseract_languages: tesseract_installed.then(list_tesseract_languages).flatten(),
         distribution: parse_distribution(&os_release),
@@ -395,6 +414,7 @@ mod tests {
                 virtual_keyboard: true,
             }),
             grim_installed: true,
+            recorder_installed: true,
             tesseract_installed: true,
             tesseract_languages: Some(vec!["eng".to_owned(), "osd".to_owned()]),
             distribution: Distribution::Arch,
@@ -628,7 +648,7 @@ mod tests {
         assert!(report.contains("[ok]"), "{report}");
         assert!(report.contains("[fail] Screen capture (grim)"), "{report}");
         assert!(report.contains("fix: sudo pacman -S grim"), "{report}");
-        assert!(report.contains("1 of 6 checks failed"), "{report}");
+        assert!(report.contains("1 of 7 checks failed"), "{report}");
     }
 
     #[test]
@@ -636,7 +656,7 @@ mod tests {
         let report = render(&diagnose(&healthy_facts()));
 
         assert!(!report.contains("[fail]"), "{report}");
-        assert!(report.contains("All 6 checks passed"), "{report}");
+        assert!(report.contains("All 7 checks passed"), "{report}");
     }
 
     #[test]
@@ -667,5 +687,34 @@ mod tests {
 
         assert_eq!(parse_tesseract_languages(output), vec!["afr", "eng", "osd"]);
         assert_eq!(parse_tesseract_languages(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_missing_screen_recorder_names_its_package_everywhere() {
+        for (distribution, expected) in [
+            (Distribution::Arch, "sudo pacman -S wf-recorder"),
+            (Distribution::Debian, "sudo apt install wf-recorder"),
+            (Distribution::Fedora, "sudo dnf install wf-recorder"),
+        ] {
+            let mut facts = healthy_facts();
+            facts.recorder_installed = false;
+            facts.distribution = distribution;
+
+            let checks = diagnose(&facts);
+
+            assert_eq!(
+                failing_names(&checks),
+                vec!["Screen recording (wf-recorder)"]
+            );
+            assert!(failing_fix(&checks, "Screen recording (wf-recorder)").contains(expected));
+        }
+        let mut facts = healthy_facts();
+        facts.recorder_installed = false;
+        facts.distribution = Distribution::Unknown;
+        let fix = failing_fix(&diagnose(&facts), "Screen recording (wf-recorder)");
+        assert!(
+            fix.contains("wf-recorder") && !fix.contains("pacman"),
+            "{fix}"
+        );
     }
 }

@@ -49,6 +49,8 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("screenshot_with_ocr", Access::Observe),
     ("find_text_on_screen", Access::Observe),
     ("clipboard_read", Access::Observe),
+    ("start_recording", Access::Observe),
+    ("stop_recording", Access::Observe),
     ("umbriel_info", Access::Observe),
     ("list_actions", Access::Observe),
     ("config_options", Access::Observe),

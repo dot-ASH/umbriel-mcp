@@ -92,19 +92,21 @@ fn an_unreachable_compositor_and_no_helpers_fail_every_check_individually() {
         "[fail] Screen capture (grim)",
         "[fail] OCR (tesseract)",
         "[fail] OCR English data",
+        "[fail] Screen recording (wf-recorder)",
     ] {
         assert!(
             report.contains(failing),
             "missing {failing:?} in:\n{report}"
         );
     }
-    assert!(report.contains("6 of 6 checks failed"), "{report}");
+    assert!(report.contains("7 of 7 checks failed"), "{report}");
 }
 
 #[test]
 fn present_helpers_and_a_reachable_socket_pass_their_own_checks() {
     let programs = scratch_directory("complete");
     install_fake_program(&programs, "grim", "exit 0");
+    install_fake_program(&programs, "wf-recorder", "exit 0");
     install_fake_program(&programs, "tesseract", &tesseract_listing(&["eng", "osd"]));
     let socket = ListeningSocket::start();
 
@@ -123,13 +125,14 @@ fn present_helpers_and_a_reachable_socket_pass_their_own_checks() {
         !output.status.success(),
         "protocol checks cannot pass without a Wayland session:\n{report}"
     );
-    assert!(report.contains("2 of 6 checks failed"), "{report}");
+    assert!(report.contains("2 of 7 checks failed"), "{report}");
 }
 
 #[test]
 fn tesseract_without_english_data_is_reported_separately_from_the_program() {
     let programs = scratch_directory("no-english");
     install_fake_program(&programs, "grim", "exit 0");
+    install_fake_program(&programs, "wf-recorder", "exit 0");
     install_fake_program(&programs, "tesseract", &tesseract_listing(&["osd", "afr"]));
     let socket = ListeningSocket::start();
 
@@ -138,13 +141,14 @@ fn tesseract_without_english_data_is_reported_separately_from_the_program() {
 
     assert!(report.contains("[ok]   OCR (tesseract)"), "{report}");
     assert!(report.contains("[fail] OCR English data"), "{report}");
-    assert!(report.contains("3 of 6 checks failed"), "{report}");
+    assert!(report.contains("3 of 7 checks failed"), "{report}");
 }
 
 #[test]
 fn a_tesseract_that_cannot_list_languages_fails_the_data_check() {
     let programs = scratch_directory("broken-tesseract");
     install_fake_program(&programs, "grim", "exit 0");
+    install_fake_program(&programs, "wf-recorder", "exit 0");
     install_fake_program(&programs, "tesseract", "echo broken >&2; exit 1");
     let socket = ListeningSocket::start();
 
@@ -180,5 +184,5 @@ fn a_ready_live_session_exits_successfully() {
         .expect("run doctor");
 
     assert!(output.status.success(), "{}", report(&output));
-    assert!(report(&output).contains("All 6 checks passed"));
+    assert!(report(&output).contains("All 7 checks passed"));
 }

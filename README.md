@@ -54,7 +54,7 @@ they have changed.
 
 ```sh
 yay -S umbriel-git                                     # the compositor, if needed
-sudo pacman -S grim tesseract tesseract-data-eng       # screen capture and OCR
+sudo pacman -S grim tesseract tesseract-data-eng wf-recorder   # screenshots, OCR, recording
 ```
 
 Then install the server as a pacman package built from this repository's recipe. It downloads
@@ -86,7 +86,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 2. Install the screen helpers:
 
    ```sh
-   sudo apt install grim tesseract-ocr tesseract-ocr-eng
+   sudo apt install grim tesseract-ocr tesseract-ocr-eng wf-recorder
    ```
 
 3. Install the server from the latest [GitHub release](https://github.com/dot-ASH/umbriel-mcp/releases):
@@ -124,7 +124,7 @@ sudo wget -O /etc/apt/sources.list.d/noctalia-trixie.sources \
   https://pkg.noctalia.dev/deb/noctalia-trixie.sources        # Sid: noctalia-unstable.sources
 sudo apt update
 sudo apt install -t trixie-backports umbriel                  # Sid: sudo apt install umbriel
-sudo apt install grim tesseract-ocr tesseract-ocr-eng
+sudo apt install grim tesseract-ocr tesseract-ocr-eng wf-recorder
 ```
 
 Then install the server from the release binary as in step 3 above and run
@@ -134,7 +134,7 @@ Then install the server from the release binary as in step 3 above and run
 
 ```sh
 sudo dnf install umbriel-nightly                              # from the Terra repository
-sudo dnf install grim tesseract tesseract-langpack-eng
+sudo dnf install grim tesseract tesseract-langpack-eng wf-recorder
 ```
 
 Then install the server from the release binary as in Ubuntu step 3 and run
@@ -164,6 +164,7 @@ external programs are needed only for the screen tools:
 | `grim` | `screenshot`, OCR tools | `grim` | `grim` | `grim` |
 | `tesseract` | `screenshot_with_ocr`, `find_text_on_screen`, `click_text` | `tesseract` | `tesseract-ocr` | `tesseract` |
 | English OCR data | same | `tesseract-data-eng` | `tesseract-ocr-eng` | `tesseract-langpack-eng` |
+| `wf-recorder` | `start_recording`, `stop_recording` | `wf-recorder` | `wf-recorder` | `wf-recorder` |
 
 The tools are always listed; a call that needs a missing program fails with an error naming
 the package to install.
@@ -215,7 +216,7 @@ Any other MCP client can use the plain stdio form:
 
 `umbriel-mcp doctor` verifies that the Umbriel socket is reachable, that the compositor
 offers the virtual-pointer and virtual-keyboard protocols, and that `grim`, `tesseract`, and
-Tesseract's English data are installed. Each problem is listed on its own with the command to
+Tesseract's English data and `wf-recorder` are installed. Each problem is listed on its own with the command to
 fix it on Arch, Debian/Ubuntu, and Fedora, or generic advice on other distributions. It exits
 with status 0 only when everything is ready.
 
@@ -283,6 +284,22 @@ hot-corner actions, and settings that can start programs, load files, or weaken 
 check (`general.autostart`, `events`, `environment`, `include`, effect shaders, `drm`,
 `screencast.disable_dynamic_confirmation`); those need `full`. Disabling your only enabled
 output is always refused, and keyboard-layout or `general.mod_key` changes come with a warning.
+
+**Recording** — `start_recording` records one monitor, or the screen area of one window that
+is on screen, to `~/Videos/umbriel-mcp/recording-<UTC time>.mp4` (or your `XDG_VIDEOS_DIR`).
+Audio is off unless asked for. A recording stops by itself after 30 seconds by default (1 second
+to 60 minutes allowed), `stop_recording` stops it sooner and reports the file, and only one runs
+at a time.
+If umbriel-mcp exits, the recording is stopped and the file finished. Recording is observation
+like screenshots, so every profile allows it. `wf-recorder` shows nothing on screen while it
+records.
+
+**Choosing what to capture** — when you ask for a screenshot or a recording without saying what
+to capture, you are asked to choose: the whole screen (screenshots only), a monitor, or a
+window. For a recording you are also asked how long, from 30 seconds to 60 minutes, with 30
+seconds preselected, unless you already said how long. Clients with dialogs show the choices in one; others have the model ask you. When the
+model takes a screenshot or starts a recording for its own purposes, it does not ask and never
+waits for you.
 
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
 `click_text`, `clipboard_read`, `clipboard_write`. With a `window_id`, `screenshot` and

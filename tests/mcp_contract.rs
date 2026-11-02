@@ -1847,3 +1847,445 @@ fn the_code_path_asks_about_the_backup_too() {
     );
     assert_eq!(backups(&home), 1, "omitting the answer keeps a backup");
 }
+
+const FAKE_RECORDER: &str = r#"
+printf '%s\n' "$@" > "$(dirname "$0")/wf-recorder.args"
+file=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "-f" ]; then file="$argument"; fi
+  previous="$argument"
+done
+trap 'printf fake-video > "$file"; exit 0' INT
+while :; do sleep 0.05; done
+"#;
+
+fn desktop_with_two_monitors() -> HashMap<String, Value> {
+    let mut replies = one_visible_and_one_hidden_window();
+    replies.insert(
+        "outputs".to_string(),
+        json!({"ok": [
+            {"name": "DP-1", "enabled": true, "focused": true, "position": {"x": 1920, "y": 0}, "logical_size": {"width": 1920, "height": 1080}},
+            {"name": "HDMI-A-1", "enabled": true, "focused": false, "position": {"x": 0, "y": 0}, "logical_size": {"width": 1920, "height": 1080}}
+        ]}),
+    );
+    replies
+}
+
+struct CaptureDesktop {
+    _fake: FakeUmbriel,
+    server: McpProcess,
+    tools: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+impl CaptureDesktop {
+    fn start(profile: &str, approval_reply: Option<Value>, recorder: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = FakeUmbriel::start(desktop_with_two_monitors());
+        let tools = fake_tools_directory(None, None);
+        recording_grim(&tools, true);
+        let recorder_path = tools.join("wf-recorder");
+        std::fs::write(&recorder_path, format!("#!/bin/sh\n{recorder}\n"))
+            .expect("write fake recorder");
+        std::fs::set_permissions(&recorder_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let home = fake_tools_directory(None, None);
+        let path = format!("{}:/usr/bin", tools.display());
+        let capabilities = if approval_reply.is_some() {
+            json!({"elicitation": {}})
+        } else {
+            json!({})
+        };
+        let server = McpProcess::start_as_client(
+            &fake.path,
+            &["--profile", profile],
+            &[
+                ("PATH", path.as_ref()),
+                ("HOME", home.as_os_str()),
+                ("XDG_CONFIG_HOME", std::ffi::OsStr::new("")),
+            ],
+            capabilities,
+            approval_reply,
+        );
+        Self {
+            _fake: fake,
+            server,
+            tools,
+            home,
+        }
+    }
+
+    fn grim_arguments(&self) -> Vec<String> {
+        grim_arguments(&self.tools.join("grim.args"))
+    }
+
+    fn recorder_arguments(&self) -> Vec<String> {
+        std::fs::read_to_string(self.tools.join("wf-recorder.args"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn recordings(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(self.home.join("Videos/umbriel-mcp"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn choose(value: &str) -> Option<Value> {
+    Some(json!({"action": "accept", "content": {"target": value}}))
+}
+
+#[test]
+fn a_user_requested_screenshot_lets_the_user_pick_a_window() {
+    let mut desktop = CaptureDesktop::start("full", choose("window:hidden"), FAKE_RECORDER);
+
+    let response = desktop
+        .server
+        .call_tool("screenshot", json!({"ask_user_what_to_capture": true}));
+
+    assert!(response.get("result").is_some(), "{response}");
+    let arguments = desktop.grim_arguments();
+    assert!(
+        arguments.windows(2).any(|pair| pair == ["-T", "hidden"]),
+        "{arguments:?}"
+    );
+    let form = &desktop.server.approval_forms[0]["properties"]["target"];
+    let offered: Vec<&str> = form["oneOf"]
+        .as_array()
+        .expect("titled choices")
+        .iter()
+        .filter_map(|choice| choice["const"].as_str())
+        .collect();
+    assert_eq!(
+        offered,
+        [
+            "screen",
+            "output:DP-1",
+            "output:HDMI-A-1",
+            "window:shown",
+            "window:hidden"
+        ]
+    );
+    assert_eq!(form["oneOf"][0]["title"], "Whole screen (all monitors)");
+    assert!(desktop.server.approval_questions[0].contains("What should the screenshot show?"));
+}
+
+#[test]
+fn declining_the_choice_captures_nothing() {
+    let mut desktop =
+        CaptureDesktop::start("full", Some(json!({"action": "decline"})), FAKE_RECORDER);
+
+    let response = desktop.server.call_tool(
+        "screenshot_with_ocr",
+        json!({"ask_user_what_to_capture": true}),
+    );
+
+    assert!(
+        text_content(&response).contains("nothing was captured"),
+        "{response}"
+    );
+    assert!(desktop.grim_arguments().is_empty());
+}
+
+#[test]
+fn without_a_dialog_the_model_is_given_the_choices_to_ask_about() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    let response = desktop
+        .server
+        .call_tool("screenshot", json!({"ask_user_what_to_capture": true}));
+
+    let text = text_content(&response);
+    assert!(text.contains("Nothing was captured yet"), "{text}");
+    assert!(
+        text.contains("- Whole screen (all monitors): leave output and window_id empty"),
+        "{text}"
+    );
+    assert!(text.contains("window_id \"hidden\""), "{text}");
+    assert!(desktop.grim_arguments().is_empty());
+}
+
+#[test]
+fn a_screenshot_the_model_takes_for_itself_never_waits_for_the_user() {
+    let mut desktop = CaptureDesktop::start("full", choose("output:DP-1"), FAKE_RECORDER);
+
+    let unasked = desktop.server.call_tool("screenshot", json!({}));
+    let targeted = desktop.server.call_tool(
+        "screenshot",
+        json!({"output": "HDMI-A-1", "ask_user_what_to_capture": true}),
+    );
+
+    assert!(unasked.get("result").is_some(), "{unasked}");
+    assert!(targeted.get("result").is_some(), "{targeted}");
+    assert!(
+        desktop.server.approval_questions.is_empty(),
+        "{:?}",
+        desktop.server.approval_questions
+    );
+}
+
+#[test]
+fn a_recording_records_the_focused_monitor_until_stopped() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    let started = desktop.server.call_tool("start_recording", json!({}));
+    let started_text = text_content(&started);
+    assert!(
+        started_text.contains("Recording monitor DP-1 without audio"),
+        "{started_text}"
+    );
+    assert!(
+        started_text.contains("stops by itself after 30 seconds"),
+        "{started_text}"
+    );
+    let arguments = desktop.recorder_arguments();
+    assert_eq!(arguments[0], "-y");
+    assert_eq!(arguments[3..], ["-o", "DP-1"]);
+    assert!(
+        arguments[2].contains("/Videos/umbriel-mcp/recording-"),
+        "{arguments:?}"
+    );
+
+    let second = desktop
+        .server
+        .call_tool("start_recording", json!({"output":"HDMI-A-1"}));
+    assert!(
+        error_message(&second).contains("already recording monitor DP-1"),
+        "{second}"
+    );
+
+    let stopped = desktop.server.call_tool("stop_recording", json!({}));
+    let stopped_text = text_content(&stopped);
+    assert!(
+        stopped_text.contains("Recording of monitor DP-1 stopped: saved"),
+        "{stopped_text}"
+    );
+    let saved = desktop.recordings();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), "fake-video");
+
+    let again = desktop.server.call_tool("stop_recording", json!({}));
+    assert!(
+        error_message(&again).contains("nothing is being recorded"),
+        "{again}"
+    );
+}
+
+#[test]
+fn a_user_requested_recording_offers_only_monitors_and_visible_windows() {
+    let mut desktop = CaptureDesktop::start("full", choose("window:shown"), FAKE_RECORDER);
+
+    let started = desktop.server.call_tool(
+        "start_recording",
+        json!({"ask_user_what_to_capture": true, "audio": true}),
+    );
+
+    assert!(text_content(&started).contains("with audio"), "{started}");
+    let arguments = desktop.recorder_arguments();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-g", "1932,46 900x500"]),
+        "{arguments:?}"
+    );
+    assert_eq!(arguments.last().map(String::as_str), Some("-a"));
+    let offered: Vec<&str> = desktop.server.approval_forms[0]["properties"]["target"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|choice| choice["const"].as_str())
+        .collect();
+    assert_eq!(offered, ["output:DP-1", "output:HDMI-A-1", "window:shown"]);
+    desktop.server.call_tool("stop_recording", json!({}));
+}
+
+#[test]
+fn a_window_that_is_not_on_screen_cannot_be_recorded() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    let response = desktop
+        .server
+        .call_tool("start_recording", json!({"window_id":"hidden"}));
+
+    assert!(
+        error_message(&response).contains("not on screen"),
+        "{response}"
+    );
+    assert!(desktop.recorder_arguments().is_empty());
+}
+
+#[test]
+fn recording_length_is_bounded() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    for seconds in [0, 3601] {
+        let response = desktop
+            .server
+            .call_tool("start_recording", json!({"duration_seconds": seconds}));
+        assert!(
+            error_message(&response).contains("between 1 and 3600"),
+            "{response}"
+        );
+    }
+}
+
+#[test]
+fn a_recorder_that_fails_at_once_reports_why_and_leaves_no_file() {
+    let mut desktop = CaptureDesktop::start(
+        "full",
+        None,
+        "echo 'failed to bind zwlr_screencopy_manager_v1' >&2; exit 1",
+    );
+
+    let response = desktop.server.call_tool("start_recording", json!({}));
+
+    let message = error_message(&response);
+    assert!(message.contains("stopped right away"), "{message}");
+    assert!(message.contains("zwlr_screencopy_manager_v1"), "{message}");
+    assert!(
+        desktop.recordings().is_empty(),
+        "{:?}",
+        desktop.recordings()
+    );
+}
+
+#[test]
+fn read_only_may_record_like_it_may_take_screenshots() {
+    let mut desktop = CaptureDesktop::start("read-only", None, FAKE_RECORDER);
+
+    let started = desktop.server.call_tool("start_recording", json!({}));
+    let stopped = desktop.server.call_tool("stop_recording", json!({}));
+
+    assert!(started.get("result").is_some(), "{started}");
+    assert!(stopped.get("result").is_some(), "{stopped}");
+}
+
+#[test]
+fn a_recording_is_finished_when_the_server_dies() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+    let started = desktop.server.call_tool("start_recording", json!({}));
+    assert!(started.get("result").is_some(), "{started}");
+    std::thread::sleep(std::time::Duration::from_secs(12));
+
+    let _ = desktop.server.child.kill();
+    let _ = desktop.server.child.wait();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let finished = desktop
+            .recordings()
+            .iter()
+            .any(|file| std::fs::read_to_string(file).is_ok_and(|text| text == "fake-video"));
+        if finished {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorder kept running after the server died"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_user_requested_recording_asks_how_long_with_thirty_seconds_preselected() {
+    let reply = Some(
+        json!({"action": "accept", "content": {"target": "output:HDMI-A-1", "duration": "300"}}),
+    );
+    let mut desktop = CaptureDesktop::start("full", reply, FAKE_RECORDER);
+
+    let started = desktop
+        .server
+        .call_tool("start_recording", json!({"ask_user_what_to_capture": true}));
+
+    assert!(
+        text_content(&started).contains("Recording monitor HDMI-A-1"),
+        "{started}"
+    );
+    assert!(
+        text_content(&started).contains("stops by itself after 5 minutes"),
+        "{started}"
+    );
+    let duration = &desktop.server.approval_forms[0]["properties"]["duration"];
+    assert_eq!(duration["default"], "30", "{duration}");
+    assert_eq!(duration["oneOf"][0]["title"], "30 seconds", "{duration}");
+    assert_eq!(duration["oneOf"][3]["const"], "300", "{duration}");
+    desktop.server.call_tool("stop_recording", json!({}));
+}
+
+#[test]
+fn a_length_the_user_already_gave_is_not_asked_again() {
+    let mut desktop = CaptureDesktop::start("full", choose("output:DP-1"), FAKE_RECORDER);
+
+    let started = desktop.server.call_tool(
+        "start_recording",
+        json!({"ask_user_what_to_capture": true, "duration_seconds": 90}),
+    );
+
+    assert!(
+        text_content(&started).contains("after 1 minute 30 seconds"),
+        "{started}"
+    );
+    assert!(
+        desktop.server.approval_forms[0]["properties"]
+            .get("duration")
+            .is_none()
+    );
+    desktop.server.call_tool("stop_recording", json!({}));
+}
+
+#[test]
+fn screenshots_never_ask_for_a_length() {
+    let mut desktop = CaptureDesktop::start("full", choose("screen"), FAKE_RECORDER);
+
+    desktop
+        .server
+        .call_tool("screenshot", json!({"ask_user_what_to_capture": true}));
+
+    assert!(
+        desktop.server.approval_forms[0]["properties"]
+            .get("duration")
+            .is_none()
+    );
+}
+
+#[test]
+fn without_a_dialog_the_model_is_told_to_ask_for_the_length_too() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    let response = desktop
+        .server
+        .call_tool("start_recording", json!({"ask_user_what_to_capture": true}));
+
+    let text = text_content(&response);
+    assert!(
+        text.contains("how long to record (default 30 seconds)"),
+        "{text}"
+    );
+    assert!(text.contains("duration_seconds"), "{text}");
+    assert!(desktop.recorder_arguments().is_empty());
+}
+
+#[test]
+fn a_short_recording_stops_by_itself() {
+    let mut desktop = CaptureDesktop::start("full", None, FAKE_RECORDER);
+
+    desktop
+        .server
+        .call_tool("start_recording", json!({"duration_seconds": 1}));
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let after = desktop.server.call_tool("stop_recording", json!({}));
+
+    let message = error_message(&after);
+    assert!(message.contains("reached its time limit"), "{message}");
+    assert_eq!(desktop.recordings().len(), 1);
+}
