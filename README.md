@@ -105,7 +105,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.2.3
+   tag=v0.3.0
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -186,13 +186,14 @@ updates in the background.
   `sudo umbriel-mcp update`.
 - If it was installed by a package manager (pacman or makepkg, `cargo install`, Nix), it refuses
   and tells you the package manager's command instead, so the two never disagree.
-- Versions 0.2.2 and older have no `update` command; run the install script once to get it.
+- Versions before 0.3.0 cannot update themselves to a signed release; run the install script
+  once to get 0.3.0, and `umbriel-mcp update` works from then on.
 - Releases are signed. `update` and the install script accept a release only if its
   `SHA256SUMS` carries a valid signature from the umbriel-mcp release key, whose public half is
   built into the binary and the script, and only then trust its checksums. A tampered or unsigned
   release is refused. Updates are protected even if the GitHub account were compromised; a first
   install with the script is not, because the script itself comes from GitHub.
-- Releases 0.2.2 and older are unsigned, so the script and `update` only install 0.2.3 and newer.
+- Releases 0.2.3 and older are unsigned, so the script and `update` only install 0.3.0 and newer.
 
 ## Requirements
 
