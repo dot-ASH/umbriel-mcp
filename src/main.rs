@@ -11,6 +11,7 @@ mod recording;
 mod register;
 mod screen;
 mod setting;
+mod update;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
 use capture_target::{CaptureTarget, Purpose};
@@ -1059,6 +1060,12 @@ struct Cli {
 enum Command {
     /// Check that Umbriel, its input protocols, screen capture, and OCR are ready
     Doctor,
+    /// Download and install the latest release in place of this binary
+    Update {
+        /// Only report whether a newer release exists
+        #[arg(long)]
+        check: bool,
+    },
     /// Register this server with an AI coding harness, or print the config to paste
     Install {
         harness: register::Harness,
@@ -1073,6 +1080,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Doctor) => return Ok(doctor::run()),
+        Some(Command::Update { check }) => return Ok(update::run(check)),
         Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
         None => {}
     }

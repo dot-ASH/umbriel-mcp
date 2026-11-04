@@ -89,23 +89,32 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
    sudo apt install grim tesseract-ocr tesseract-ocr-eng wf-recorder
    ```
 
-3. Install the server from the latest [GitHub release](https://github.com/dot-ASH/umbriel-mcp/releases):
+3. Install the server:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/dot-ASH/umbriel-mcp/main/install.sh | sh
+   ```
+
+   This downloads the latest release for your architecture, checks it against the release's
+   `SHA256SUMS`, installs it to `~/.local/bin/umbriel-mcp` (no `sudo`), and runs
+   `umbriel-mcp doctor`. Ubuntu adds `~/.local/bin` to `PATH` at login once the folder exists,
+   so log out and back in if `umbriel-mcp` is not found afterwards. If you installed an older
+   version into `/usr/local/bin`, the script tells you to remove it.
+
+   <details><summary>Manual install without the script</summary>
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.2.2
+   tag=v0.2.3
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
    sha256sum --check --ignore-missing SHA256SUMS
    tar -xzf "umbriel-mcp-$tag-$arch-linux.tar.gz"
-   sudo install -Dm755 "umbriel-mcp-$tag-$arch-linux/umbriel-mcp" /usr/local/bin/umbriel-mcp
+   install -Dm755 "umbriel-mcp-$tag-$arch-linux/umbriel-mcp" ~/.local/bin/umbriel-mcp
    ```
 
-   `/usr/local/bin` is on every user's `PATH`, so harnesses started from the Umbriel session
-   find the binary without extra setup. To install without `sudo`, use
-   `~/.local/bin/umbriel-mcp` instead; Ubuntu adds `~/.local/bin` to `PATH` at login only if
-   the directory already existed, so log out and back in after creating it.
+   </details>
 
 4. Check the setup from a terminal inside the Umbriel session:
 
@@ -127,8 +136,11 @@ sudo apt install -t trixie-backports umbriel                  # Sid: sudo apt in
 sudo apt install grim tesseract-ocr tesseract-ocr-eng wf-recorder
 ```
 
-Then install the server from the release binary as in step 3 above and run
-`umbriel-mcp doctor`.
+Then install the server, which also runs `umbriel-mcp doctor`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dot-ASH/umbriel-mcp/main/install.sh | sh
+```
 
 ### Fedora
 
@@ -137,14 +149,17 @@ sudo dnf install umbriel-nightly                              # from the Terra r
 sudo dnf install grim tesseract tesseract-langpack-eng wf-recorder
 ```
 
-Then install the server from the release binary as in Ubuntu step 3 and run
-`umbriel-mcp doctor`.
+Then install the server, which also runs `umbriel-mcp doctor`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dot-ASH/umbriel-mcp/main/install.sh | sh
+```
 
 ### Other distributions
 
 Install Umbriel following [its installation page](https://docs.noctalia.dev/umbriel/installation/),
 then `grim`, `tesseract`, and Tesseract's English data (`eng.traineddata`) from your package
-manager. Install the server from the release binary as in Ubuntu step 3, or build it with
+manager. Install the server with `curl -fsSL https://raw.githubusercontent.com/dot-ASH/umbriel-mcp/main/install.sh | sh`, or build it with
 Cargo (needs Rust 1.89 or newer, for example from [rustup](https://rustup.rs)):
 
 ```sh
@@ -153,6 +168,27 @@ cargo install umbriel-mcp --locked
 
 `umbriel-mcp doctor` names the exact packages to install on Arch, Debian/Ubuntu, and Fedora,
 and gives generic guidance elsewhere.
+
+## Updating
+
+```sh
+umbriel-mcp update            # install the latest release in place
+umbriel-mcp update --check    # only report whether one exists
+```
+
+`update` downloads the latest release, checks it against `SHA256SUMS`, confirms the new
+binary runs and reports the expected version, and only then replaces the old one, so a failed
+update leaves the old binary working. Restart your harness afterwards; running sessions keep
+the old version. `umbriel-mcp doctor` also says when a newer version exists. Nothing checks for
+updates in the background.
+
+- If the binary is in a folder you cannot write to, such as `/usr/local/bin`, it asks you to run
+  `sudo umbriel-mcp update`.
+- If it was installed by a package manager (pacman or makepkg, `cargo install`, Nix), it refuses
+  and tells you the package manager's command instead, so the two never disagree.
+- Versions 0.2.2 and older have no `update` command; run the install script once to get it.
+- The checksum proves the download matches the GitHub release. It cannot protect against a
+  compromised GitHub account; releases are not yet signed.
 
 ## Requirements
 

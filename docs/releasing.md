@@ -11,7 +11,7 @@ Set the new version `X.Y.Z` in all of these:
 - `Cargo.toml` (`version`)
 - `server.json`, twice: the top-level `version` and the package `version`
 - `packaging/aur-bin/PKGBUILD` and `packaging/PKGBUILD` (`pkgver`)
-- `README.md`, the `tag=vX.Y.Z` line in the release-binary install steps
+- `README.md`, the `tag=vX.Y.Z` line in the manual install steps
 
 In `packaging/aur-bin/PKGBUILD`, set both `sha256sums_x86_64` and `sha256sums_aarch64` back to
 `('SKIP')` and delete `packaging/aur-bin/.SRCINFO`. The old checksums belong to the old tarballs;
@@ -106,3 +106,10 @@ section to `yay -S umbriel-mcp-bin`.
 
 `packaging/PKGBUILD` is a build-from-source recipe kept as a starting point for contributors;
 it is not published.
+
+`install.sh` is served from the `main` branch
+(`https://raw.githubusercontent.com/dot-ASH/umbriel-mcp/main/install.sh`), not from a release,
+so changes to it reach new users as soon as they are pushed. It and `umbriel-mcp update` both
+find the newest release through `releases/latest/download/SHA256SUMS`, so a release is picked
+up the moment its workflow finishes uploading.
+

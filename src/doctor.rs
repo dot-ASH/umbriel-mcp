@@ -392,6 +392,7 @@ fn gather_facts() -> Facts {
 pub fn run() -> ExitCode {
     let checks = diagnose(&gather_facts());
     print!("{}", render(&checks));
+    println!("\n{}", crate::update::notice());
     if all_ready(&checks) {
         ExitCode::SUCCESS
     } else {

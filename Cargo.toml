@@ -1,6 +1,6 @@
 [package]
 name = "umbriel-mcp"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Nafees Ashker Sakir <nafees.ashker@gmail.com>"]
@@ -29,6 +29,7 @@ wl-clipboard-rs = "0.9.5"
 rustix = { version = "1.1.6", features = ["fs", "event", "process"] }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 toml_edit = "0.25.17"
+sha2 = "0.11.1"
 
 [profile.release]
 strip = true
