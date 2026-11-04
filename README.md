@@ -105,7 +105,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.3.0
+   tag=v0.4.0
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -278,14 +278,25 @@ type into a focused terminal can still run commands through the input tools.
 ## Tools
 
 **Inspection** — `list_windows`, `list_workspaces`, `list_outputs`, `get_active_window`,
-`list_layers`
+`list_layers`. Window and monitor listings are brief by default: id, app, title, place, size,
+workspace and `has_keyboard_focus` for windows; name, position, size, current mode, scale and
+workspace for monitors. Pass `detail: true` for every field Umbriel reports, including every
+display mode.
 
 **Window and workspace control** — `switch_workspace`, `focus_window`, `close_window`,
 `kill_window`, `move_window_to_workspace`, `toggle_fullscreen`, `toggle_floating`,
 `resize_window`, `set_workspace_layout`, `toggle_overview`, `launch_app`, `run_action`
 
 **Input** — `mouse_move`, `mouse_click`, `mouse_scroll`, `mouse_drag`, `type_text`,
-`key_press`
+`key_press`. These drive your real mouse and keyboard, so they collide with you if you use the
+desktop at the same time; the server tells agents to ask before taking over. To keep input
+where it was meant to go:
+
+- `type_text` and `key_press` take a `window_id`: if that window does not have keyboard focus,
+  nothing is typed and the error names the window that does.
+- `mouse_click` and `mouse_move` take a `window_id` with `x` and `y` counted from that window's
+  top-left corner. A window that is not on screen, or a point outside it, is refused.
+- After typing, pressing or clicking, the result says which window has keyboard focus.
 
 **About Umbriel itself** — `umbriel_info` (version, keyboard layouts, submap, color and
 tearing state), `list_actions` (every action `run_action` and keybinds accept, filterable),
@@ -346,9 +357,19 @@ model takes a screenshot or starts a recording for its own purposes, it does not
 waits for you.
 
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
-`click_text`, `clipboard_read`, `clipboard_write`. With a `window_id`, `screenshot` and
-`screenshot_with_ocr` capture that window even on a hidden workspace, without switching to it
-(needs `grim` 1.5 or newer; older `grim` can only capture windows that are on screen).
+`click_text`, `wait_for_text`, `wait_for_change`, `clipboard_read`, `clipboard_write`.
+
+- With a `window_id`, captures and text search cover only that window, even on a hidden
+  workspace, without switching to it (needs `grim` 1.5 or newer; older `grim` can only capture
+  windows that are on screen). This leaves your other windows out of the picture.
+- With a `region` (`x`, `y`, `width`, `height` in screen coordinates), they cover only that
+  rectangle, at full resolution, to zoom in on a detail.
+- Every capture says when it was taken, and notes when a window's title changed since its last
+  capture, which usually means it shows a different page or someone else is using it.
+- `wait_for_text` waits until text appears. `wait_for_change` waits until a window, monitor or
+  region differs from your previous capture of it and then stops changing, and returns the
+  settled picture; if nothing changed, it says so. Both give up after 10 seconds by default
+  (30 at most), so an agent can wait for a page to load instead of guessing with sleeps.
 
 `key_press` takes chords such as `ctrl+shift+Tab`, `super+q`, `F5` or `alt+Left`; an uppercase
 letter (`ctrl+A`) implies Shift. `type_text` accepts any Unicode text, with `\n` typed as Return

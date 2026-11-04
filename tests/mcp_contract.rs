@@ -2362,3 +2362,459 @@ fn disabling_an_input_device_carries_a_caution() {
         "{previewed}"
     );
 }
+
+fn richly_described_desktop() -> HashMap<String, Value> {
+    let window = json!({
+        "id": "zen-1", "app_id": "zen", "title": "HRMS — Zen Browser", "output": "HDMI-A-1",
+        "workspace": "HDMI-A-1:1", "focused": true, "visible": true, "floating": false,
+        "fullscreen": false, "minimized": false, "x": 7, "y": 35, "w": 1906, "h": 1038,
+        "pid": 4242, "border_effect": {"name": "", "source": "default"}, "scratchpad": "",
+        "window_effect": {"name": ""}, "tab_index": -1, "xdg_tag": ""
+    });
+    HashMap::from([
+        ("windows".to_owned(), json!({"ok": [window.clone()]})),
+        ("focused-window".to_owned(), json!({"ok": window})),
+        (
+            "outputs".to_owned(),
+            json!({"ok": [{
+                "name": "HDMI-A-1", "description": "LG Electronics LG FULL HD (HDMI-A-1)",
+                "enabled": true, "focused": true, "position": {"x": 0, "y": 0},
+                "logical_size": {"width": 1920, "height": 1080}, "scale": 1,
+                "transform": "normal", "active_workspace": "HDMI-A-1:1",
+                "modes": [
+                    {"width": 1920, "height": 1080, "refresh_mhz": 60000, "current": true},
+                    {"width": 1280, "height": 720, "refresh_mhz": 60000, "current": false}
+                ],
+                "direct_scanout": {"active": false}, "serial": "101NTKFD1205"
+            }]}),
+        ),
+    ])
+}
+
+fn listed_json(server: &mut McpProcess, tool: &str, arguments: Value) -> Value {
+    serde_json::from_str(&server.call_text(tool, arguments)).expect("listing JSON")
+}
+
+#[test]
+fn window_listings_are_brief_unless_detail_is_asked_for() {
+    let fake = FakeUmbriel::start(richly_described_desktop());
+    let mut server = McpProcess::start(&fake.path);
+
+    let brief = listed_json(&mut server, "list_windows", json!({}));
+    let detailed = listed_json(&mut server, "list_windows", json!({"detail": true}));
+    let active = listed_json(&mut server, "get_active_window", json!({}));
+
+    for window in [&brief[0], &active] {
+        for key in [
+            "id",
+            "app_id",
+            "title",
+            "workspace",
+            "output",
+            "x",
+            "y",
+            "w",
+            "h",
+        ] {
+            assert!(window.get(key).is_some(), "missing {key}: {window}");
+        }
+        for key in [
+            "border_effect",
+            "window_effect",
+            "scratchpad",
+            "tab_index",
+            "pid",
+        ] {
+            assert!(
+                window.get(key).is_none(),
+                "{key} should be left out: {window}"
+            );
+        }
+    }
+    assert_eq!(detailed[0]["border_effect"]["source"], "default");
+}
+
+#[test]
+fn the_brief_listing_marks_keyboard_focus_from_the_focused_window_not_per_window_flags() {
+    let mut replies = desktop_with_a_hidden_window();
+    replies.insert(
+        "windows".to_owned(),
+        json!({"ok": [
+            { "id": "zen-1", "title": "HRMS", "focused": true },
+            { "id": "chat", "title": "Teams", "focused": true }
+        ]}),
+    );
+    let fake = FakeUmbriel::start(replies);
+    let mut server = McpProcess::start(&fake.path);
+
+    let brief = listed_json(&mut server, "list_windows", json!({}));
+
+    assert_eq!(brief[0]["has_keyboard_focus"], true, "{brief}");
+    assert_eq!(brief[1]["has_keyboard_focus"], false, "{brief}");
+    assert!(brief[1].get("focused").is_none(), "{brief}");
+}
+
+#[test]
+fn output_listings_are_brief_unless_detail_is_asked_for() {
+    let fake = FakeUmbriel::start(richly_described_desktop());
+    let mut server = McpProcess::start(&fake.path);
+
+    let brief = listed_json(&mut server, "list_outputs", json!({}));
+    let detailed = listed_json(&mut server, "list_outputs", json!({"detail": true}));
+
+    let output = &brief[0];
+    assert_eq!(output["name"], "HDMI-A-1");
+    assert_eq!(output["position"]["x"], 0);
+    assert_eq!(output["logical_size"]["width"], 1920);
+    assert_eq!(output["mode"], "1920x1080@60Hz");
+    assert_eq!(output["active_workspace"], "HDMI-A-1:1");
+    for key in ["modes", "direct_scanout", "serial"] {
+        assert!(
+            output.get(key).is_none(),
+            "{key} should be left out: {output}"
+        );
+    }
+    assert_eq!(detailed[0]["modes"].as_array().map(Vec::len), Some(2));
+}
+
+fn blank_frame(folder: &std::path::Path, shade: u8) -> std::path::PathBuf {
+    let path = folder.join(format!("blank-{shade}.png"));
+    image::GrayImage::from_pixel(640, 360, image::Luma([shade]))
+        .save(&path)
+        .expect("write blank frame");
+    path
+}
+
+fn fixture_frame() -> std::path::PathBuf {
+    std::path::PathBuf::from(OCR_FIXTURE)
+}
+
+fn grim_playing(tools: &std::path::Path, frames: &[std::path::PathBuf]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let record = tools.join("grim.args");
+    let counter = tools.join("grim.count");
+    let mut choose = String::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let test = if index + 1 == frames.len() {
+            "else".to_owned()
+        } else if index == 0 {
+            format!("if [ \"$n\" -le {} ]; then", index + 1)
+        } else {
+            format!("elif [ \"$n\" -le {} ]; then", index + 1)
+        };
+        choose.push_str(&format!("{test} exec /usr/bin/cat '{}'\n", frame.display()));
+    }
+    if frames.len() > 1 {
+        choose.push_str("fi\n");
+    } else {
+        choose = choose.replacen("else ", "", 1);
+    }
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then echo '  -T <identifier> Capture a toplevel.'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{record}'\nn=$(( $(cat '{counter}' 2>/dev/null || echo 0) + 1 ))\necho \"$n\" > '{counter}'\n{choose}",
+        record = record.display(),
+        counter = counter.display(),
+    );
+    let path = tools.join("grim");
+    std::fs::write(&path, script).expect("write fake grim");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    record
+}
+
+fn start_without_a_real_display(fake: &FakeUmbriel, tools: &std::path::Path) -> McpProcess {
+    let path = format!("{}:/usr/bin", tools.display());
+    let runtime = support::scratch_directory("no-display");
+    McpProcess::start_with_environment(
+        &fake.path,
+        &[],
+        &[
+            ("PATH", path.as_ref()),
+            ("WAYLAND_DISPLAY", "umbriel-mcp-test-no-display".as_ref()),
+            ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+        ],
+    )
+}
+
+fn start_playing(frames: &[std::path::PathBuf]) -> (FakeUmbriel, McpProcess, std::path::PathBuf) {
+    let fake = FakeUmbriel::start(one_visible_and_one_hidden_window());
+    let tools = fake_tools_directory(None, None);
+    let record = grim_playing(&tools, frames);
+    let server = start_without_a_real_display(&fake, &tools);
+    (fake, server, record)
+}
+
+fn image_count(response: &Value) -> usize {
+    response["result"]["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_region_screenshot_captures_that_area_and_reports_its_origin_and_time() {
+    let (_fake, mut server, record) = start_playing(&[fixture_frame()]);
+
+    let response = server.call_tool(
+        "screenshot",
+        json!({"region": {"x": 100, "y": 200, "width": 300, "height": 150}}),
+    );
+
+    let arguments = grim_arguments(&record);
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-g", "100,200 300x150"]),
+        "{arguments:?}"
+    );
+    let note = text_content(&response);
+    assert!(note.contains("absolute (100, 200)"), "{note}");
+    assert!(note.contains("Captured at "), "{note}");
+}
+
+#[test]
+fn a_capture_names_only_one_target() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    let response = server.call_tool(
+        "screenshot",
+        json!({"window_id": "shown", "region": {"x": 0, "y": 0, "width": 10, "height": 10}}),
+    );
+
+    assert!(error_message(&response).contains("only one"), "{response}");
+}
+
+#[test]
+fn a_window_whose_title_changed_since_its_last_capture_is_flagged() {
+    let (fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    let first = server.call_text("screenshot", json!({"window_id": "shown"}));
+    fake.set_reply(
+        "windows",
+        json!({"ok": [{ "id": "shown", "title": "WhatsApp Business", "output": "DP-1",
+                        "workspace": "DP-1:1", "visible": true, "x": 1932, "y": 46,
+                        "w": 900, "h": 500 }]}),
+    );
+    let second = server.call_text("screenshot", json!({"window_id": "shown"}));
+
+    assert!(!first.contains("title"), "{first}");
+    assert!(second.contains("\"WhatsApp Business\""), "{second}");
+    assert!(second.contains("was \"editor\""), "{second}");
+}
+
+fn first_screen_x(found: &str) -> i64 {
+    let after = found
+        .split("at screen (")
+        .nth(1)
+        .expect("a match with coordinates");
+    after
+        .split(',')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("x coordinate")
+}
+
+#[test]
+fn text_search_can_be_limited_to_one_window_and_reports_screen_coordinates() {
+    let (_fake, mut server, record) = start_playing(&[fixture_frame()]);
+
+    let found = server.call_text(
+        "find_text_on_screen",
+        json!({"target": "Cancel", "window_id": "shown"}),
+    );
+
+    let arguments = grim_arguments(&record);
+    assert!(
+        arguments.windows(2).any(|pair| pair == ["-T", "shown"]),
+        "{arguments:?}"
+    );
+    assert!(first_screen_x(&found) > 1932, "{found}");
+}
+
+#[test]
+fn click_text_refuses_a_window_that_is_not_on_screen() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    let response = server.call_tool(
+        "click_text",
+        json!({"target": "Cancel", "window_id": "hidden"}),
+    );
+
+    let message = error_message(&response);
+    assert!(message.contains("not on screen"), "{message}");
+}
+
+#[test]
+fn wait_for_text_returns_once_the_text_appears() {
+    let tools = support::scratch_directory("frames");
+    let blank = blank_frame(&tools, 255);
+    let (_fake, mut server, _record) = start_playing(&[blank.clone(), blank, fixture_frame()]);
+
+    let found = server.call_text(
+        "wait_for_text",
+        json!({"target": "Cancel", "timeout_ms": 8000}),
+    );
+
+    assert!(found.contains("\"Cancel\""), "{found}");
+    assert!(found.contains("appeared after"), "{found}");
+}
+
+#[test]
+fn wait_for_text_gives_up_at_its_timeout() {
+    let tools = support::scratch_directory("frames");
+    let (_fake, mut server, _record) = start_playing(&[blank_frame(&tools, 255)]);
+
+    let started = std::time::Instant::now();
+    let response = server.call_text(
+        "wait_for_text",
+        json!({"target": "Cancel", "timeout_ms": 600}),
+    );
+
+    assert!(response.contains("no match"), "{response}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn wait_for_change_compares_with_the_previous_capture_and_returns_the_settled_screen() {
+    let tools = support::scratch_directory("frames");
+    let (_fake, mut server, _record) =
+        start_playing(&[fixture_frame(), fixture_frame(), blank_frame(&tools, 30)]);
+
+    server.call_text("screenshot", json!({}));
+    let response = server.call_tool("wait_for_change", json!({"timeout_ms": 8000}));
+
+    let note = text_content(&response);
+    assert!(note.contains("changed after"), "{note}");
+    assert!(note.contains("settled"), "{note}");
+    assert_eq!(image_count(&response), 1, "{response}");
+}
+
+#[test]
+fn wait_for_change_reports_when_nothing_changed() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    server.call_text("screenshot", json!({}));
+    let note = server.call_text("wait_for_change", json!({"timeout_ms": 600}));
+
+    assert!(note.contains("did not change"), "{note}");
+}
+
+fn desktop_with_a_hidden_window() -> HashMap<String, Value> {
+    let mut replies = richly_described_desktop();
+    replies.insert(
+        "windows".to_owned(),
+        json!({"ok": [
+            { "id": "zen-1", "app_id": "zen", "title": "HRMS — Zen Browser", "output": "HDMI-A-1",
+              "workspace": "HDMI-A-1:1", "focused": true, "visible": true,
+              "x": 7, "y": 35, "w": 1906, "h": 1038 },
+            { "id": "chat", "app_id": "teams", "title": "Teams", "output": "DP-1",
+              "workspace": "DP-1:3", "focused": false, "visible": false,
+              "x": 1932, "y": 35, "w": 1896, "h": 1038 }
+        ]}),
+    );
+    replies
+}
+
+fn start_input_test() -> (FakeUmbriel, McpProcess) {
+    let fake = FakeUmbriel::start(desktop_with_a_hidden_window());
+    let tools = fake_tools_directory(None, None);
+    let server = start_without_a_real_display(&fake, &tools);
+    (fake, server)
+}
+
+#[test]
+fn typing_for_a_window_without_focus_is_refused_and_names_who_has_focus() {
+    let (_fake, mut server) = start_input_test();
+
+    let typed = server.call_tool("type_text", json!({"text": "hello", "window_id": "chat"}));
+    let pressed = server.call_tool("key_press", json!({"keys": "Escape", "window_id": "chat"}));
+
+    let typed = error_message(&typed);
+    assert!(typed.contains("nothing was typed"), "{typed}");
+    assert!(typed.contains("zen-1"), "{typed}");
+    assert!(typed.contains("focus_window"), "{typed}");
+    assert!(
+        error_message(&pressed).contains("nothing was pressed"),
+        "{pressed}"
+    );
+}
+
+#[test]
+fn typing_for_the_focused_window_passes_the_focus_check() {
+    let (_fake, mut server) = start_input_test();
+
+    let typed = server.call_tool("type_text", json!({"text": "hello", "window_id": "zen-1"}));
+
+    let message = error_message(&typed);
+    assert!(!message.contains("keyboard focus"), "{message}");
+}
+
+#[test]
+fn clicks_and_moves_inside_a_window_use_coordinates_relative_to_it() {
+    let (_fake, mut server) = start_input_test();
+
+    let moved = server.call_tool(
+        "mouse_move",
+        json!({"window_id": "zen-1", "x": 10, "y": 20}),
+    );
+    let clicked = server.call_tool(
+        "mouse_click",
+        json!({"window_id": "zen-1", "x": 10, "y": 20}),
+    );
+
+    assert!(error_message(&moved).contains("(17, 55)"), "{moved}");
+    assert!(error_message(&clicked).contains("(17, 55)"), "{clicked}");
+}
+
+#[test]
+fn window_clicks_are_refused_off_screen_outside_the_window_or_without_a_point() {
+    let (_fake, mut server) = start_input_test();
+
+    let hidden = server.call_tool("mouse_click", json!({"window_id": "chat", "x": 5, "y": 5}));
+    let outside = server.call_tool(
+        "mouse_click",
+        json!({"window_id": "zen-1", "x": 5000, "y": 5}),
+    );
+    let pointless = server.call_tool("mouse_click", json!({"window_id": "zen-1"}));
+
+    assert!(error_message(&hidden).contains("not on screen"), "{hidden}");
+    assert!(error_message(&outside).contains("outside"), "{outside}");
+    assert!(error_message(&pointless).contains("x and y"), "{pointless}");
+}
+
+#[test]
+fn the_instructions_ask_agents_to_share_the_desktop_carefully() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let initialized = server.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "instructions-check", "version": "1" }
+        }),
+    );
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+
+    for expected in [
+        "ask the user before",
+        "window_id",
+        "wait_for_change",
+        "wait_for_text",
+        "instead of sleeping",
+    ] {
+        assert!(
+            instructions.contains(expected),
+            "missing {expected:?}: {instructions}"
+        );
+    }
+}

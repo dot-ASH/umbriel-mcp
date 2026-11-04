@@ -76,6 +76,7 @@ pub fn error_message(response: &Value) -> String {
 pub struct FakeUmbriel {
     pub path: PathBuf,
     requests: Arc<Mutex<Vec<Value>>>,
+    state: Arc<Mutex<FakeState>>,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -100,15 +101,20 @@ impl FakeUmbriel {
         let running = Arc::new(AtomicBool::new(true));
         let worker_requests = Arc::clone(&requests);
         let worker_running = Arc::clone(&running);
-        let mut state = FakeState {
+        let state = Arc::new(Mutex::new(FakeState {
             replies,
             focus,
             pending_focus: None,
-        };
+        }));
+        let worker_state = Arc::clone(&state);
         let worker = thread::spawn(move || {
             while worker_running.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_fake_request(stream, &mut state, &worker_requests),
+                    Ok((stream, _)) => handle_fake_request(
+                        stream,
+                        &mut worker_state.lock().expect("fake state lock"),
+                        &worker_requests,
+                    ),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -120,9 +126,18 @@ impl FakeUmbriel {
         Self {
             path,
             requests,
+            state,
             running,
             worker: Some(worker),
         }
+    }
+
+    pub fn set_reply(&self, command: &str, reply: Value) {
+        self.state
+            .lock()
+            .expect("fake state lock")
+            .replies
+            .insert(command.to_owned(), reply);
     }
 
     pub fn requests(&self) -> Vec<Value> {

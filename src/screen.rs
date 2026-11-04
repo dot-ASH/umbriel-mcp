@@ -5,11 +5,125 @@ use image::{DynamicImage, ImageFormat};
 use std::io::{Cursor, Write};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_WIDTH: u32 = 1024;
 const JPEG_QUALITY: u8 = 80;
 const MINIMUM_WORD_COLUMNS: usize = 12;
 const WORD_GAP_LIMIT_IN_LINE_HEIGHTS: f32 = 1.2;
+const FINGERPRINT_WIDTH: u32 = 256;
+const PIXEL_DIFFERENCE_THAT_COUNTS: u8 = 24;
+const CHANGED_PIXEL_SHARE: f64 = 0.0005;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub x: i64,
+    pub y: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Region {
+    fn geometry(&self) -> String {
+        format!("{},{} {}x{}", self.x, self.y, self.width, self.height)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Area {
+    WholeScreen,
+    Output(String),
+    Window(String),
+    Region(Region),
+}
+
+impl Area {
+    pub fn from_choice(
+        output: Option<String>,
+        window_id: Option<String>,
+        region: Option<Region>,
+    ) -> Result<Self> {
+        match (output, window_id, region) {
+            (None, None, None) => Ok(Area::WholeScreen),
+            (Some(name), None, None) => Ok(Area::Output(name)),
+            (None, Some(id), None) => Ok(Area::Window(id)),
+            (None, None, Some(region)) if region.width == 0 || region.height == 0 => {
+                Err(anyhow!("a region needs a width and height above 0"))
+            }
+            (None, None, Some(region)) => Ok(Area::Region(region)),
+            _ => Err(anyhow!(
+                "give only one of output, window_id or region; they each choose what to capture"
+            )),
+        }
+    }
+
+    pub fn key(&self) -> String {
+        match self {
+            Area::WholeScreen => "screen".to_owned(),
+            Area::Output(name) => format!("output {name}"),
+            Area::Window(id) => format!("window {id}"),
+            Area::Region(region) => format!("region {}", region.geometry()),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Area::WholeScreen => "the whole screen".to_owned(),
+            Area::Output(name) => format!("monitor {name}"),
+            Area::Window(id) => format!("window {id}"),
+            Area::Region(region) => format!("the region {}", region.geometry()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fingerprint {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl Fingerprint {
+    fn of(image: &DynamicImage) -> Self {
+        let height = ((image.height() as f64 * FINGERPRINT_WIDTH as f64)
+            / image.width().max(1) as f64)
+            .round()
+            .max(1.0) as u32;
+        let small = image
+            .resize_exact(FINGERPRINT_WIDTH, height, FilterType::Triangle)
+            .to_luma8();
+        Self {
+            width: small.width(),
+            height: small.height(),
+            pixels: small.into_raw(),
+        }
+    }
+
+    pub fn differs_from(&self, other: &Fingerprint) -> bool {
+        if (self.width, self.height) != (other.width, other.height) {
+            return true;
+        }
+        let changed = self
+            .pixels
+            .iter()
+            .zip(&other.pixels)
+            .filter(|(a, b)| a.abs_diff(**b) >= PIXEL_DIFFERENCE_THAT_COUNTS)
+            .count();
+        changed as f64 / self.pixels.len().max(1) as f64 > CHANGED_PIXEL_SHARE
+    }
+}
+
+pub fn clock_time(moment: SystemTime) -> String {
+    let since_epoch = moment.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds_today = since_epoch.as_secs() % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03} UTC",
+        seconds_today / 3600,
+        seconds_today / 60 % 60,
+        seconds_today % 60,
+        since_epoch.subsec_millis()
+    )
+}
 
 pub struct Capture {
     pub jpeg: Vec<u8>,
@@ -21,6 +135,9 @@ pub struct Capture {
     pub origin_x: i64,
     pub origin_y: i64,
     pub shown_on_screen: bool,
+    pub captured_at: SystemTime,
+    pub window_title: Option<String>,
+    pub fingerprint: Fingerprint,
 }
 
 impl Capture {
@@ -28,6 +145,7 @@ impl Capture {
         let decoded = image::load_from_memory(png).context("could not decode the screenshot")?;
         let native_width = decoded.width();
         let native_height = decoded.height();
+        let fingerprint = Fingerprint::of(&decoded);
 
         let scaled = if native_width > max_width && max_width > 0 {
             let height =
@@ -51,6 +169,9 @@ impl Capture {
             origin_x: origin.0,
             origin_y: origin.1,
             shown_on_screen: true,
+            captured_at: SystemTime::now(),
+            window_title: None,
+            fingerprint,
         })
     }
 
@@ -64,7 +185,8 @@ impl Capture {
         };
         format!(
             "Image is {}x{} covering a {}x{} region whose top-left is absolute ({}, {}). \
-             To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}.{visibility}",
+             To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}. \
+             Captured at {}.{visibility}",
             self.encoded_width,
             self.encoded_height,
             self.native_width,
@@ -74,7 +196,15 @@ impl Capture {
             factor,
             self.origin_x,
             factor,
-            self.origin_y
+            self.origin_y,
+            clock_time(self.captured_at)
+        )
+    }
+
+    pub fn screen_point(&self, image_x: u32, image_y: u32) -> (i64, i64) {
+        (
+            i64::from(image_x) + self.origin_x,
+            i64::from(image_y) + self.origin_y,
         )
     }
 }
@@ -158,16 +288,21 @@ fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlaceme
     Ok((png, placement))
 }
 
-pub fn capture(output: Option<&str>, window_id: Option<&str>, max_width: u32) -> Result<Capture> {
-    if let Some(id) = window_id {
-        let (png, placement) = capture_window(id)?;
-        let mut capture = Capture::from_png(&png, placement.origin, max_width)?;
-        capture.shown_on_screen = placement.shown_on_screen;
-        return Ok(capture);
-    }
-    let (png, origin) = match output {
-        Some(name) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
-        None => (grim(&[])?, (0, 0)),
+pub fn capture(area: &Area, max_width: u32) -> Result<Capture> {
+    let (png, origin) = match area {
+        Area::Window(id) => {
+            let (png, placement) = capture_window(id)?;
+            let mut capture = Capture::from_png(&png, placement.origin, max_width)?;
+            capture.shown_on_screen = placement.shown_on_screen;
+            capture.window_title = placement.title;
+            return Ok(capture);
+        }
+        Area::Output(name) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
+        Area::Region(region) => (
+            grim(&["-g".into(), region.geometry()])?,
+            (region.x, region.y),
+        ),
+        Area::WholeScreen => (grim(&[])?, (0, 0)),
     };
     Capture::from_png(&png, origin, max_width)
 }
@@ -285,17 +420,30 @@ fn recognised_words(tsv: &str) -> Vec<RecognisedWord> {
         .collect()
 }
 
-fn phrases_in_reading_order(mut words: Vec<RecognisedWord>) -> Vec<Vec<RecognisedWord>> {
-    words.sort_by(|a, b| {
-        let same_row = (a.top - b.top).abs() <= a.height.max(b.height) / 2.0;
-        if same_row {
-            a.left.total_cmp(&b.left)
-        } else {
-            a.top.total_cmp(&b.top)
-        }
-    });
-    let mut phrases: Vec<Vec<RecognisedWord>> = Vec::new();
+fn rows_top_to_bottom(mut words: Vec<RecognisedWord>) -> Vec<Vec<RecognisedWord>> {
+    words.sort_by(|a, b| a.top.total_cmp(&b.top));
+    let mut rows: Vec<Vec<RecognisedWord>> = Vec::new();
     for word in words {
+        let joins_current_row = rows
+            .last()
+            .and_then(|row| row.first())
+            .is_some_and(|first| {
+                (word.top - first.top).abs() <= word.height.max(first.height) / 2.0
+            });
+        match rows.last_mut() {
+            Some(row) if joins_current_row => row.push(word),
+            _ => rows.push(vec![word]),
+        }
+    }
+    for row in &mut rows {
+        row.sort_by(|a, b| a.left.total_cmp(&b.left));
+    }
+    rows
+}
+
+fn phrases_in_reading_order(words: Vec<RecognisedWord>) -> Vec<Vec<RecognisedWord>> {
+    let mut phrases: Vec<Vec<RecognisedWord>> = Vec::new();
+    for word in rows_top_to_bottom(words).into_iter().flatten() {
         match phrases.last_mut() {
             Some(phrase)
                 if phrase
@@ -373,7 +521,9 @@ pub fn find_text(image_bytes: &[u8], needle: &str) -> Result<Vec<TextMatch>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capture, find_text, matches_in_tsv, read_text};
+    use super::{
+        Area, Capture, Fingerprint, Region, clock_time, find_text, matches_in_tsv, read_text,
+    };
     use image::{DynamicImage, ImageFormat};
     use std::io::Cursor;
 
@@ -537,5 +687,89 @@ mod tests {
         assert_eq!((native.width(), native.height()), (3840, 1080));
         let preview = image::load_from_memory(&capture.jpeg).unwrap();
         assert_eq!(preview.width(), 1024);
+    }
+
+    fn region(width: u32, height: u32) -> Region {
+        Region {
+            x: 10,
+            y: 20,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_capture_area_is_chosen_by_at_most_one_target() {
+        assert_eq!(
+            Area::from_choice(None, None, None).unwrap(),
+            Area::WholeScreen
+        );
+        assert_eq!(
+            Area::from_choice(None, None, Some(region(5, 6))).unwrap(),
+            Area::Region(region(5, 6))
+        );
+        let both = Area::from_choice(Some("DP-1".into()), Some("w".into()), None);
+        assert!(both.unwrap_err().to_string().contains("only one"));
+        assert!(Area::from_choice(None, None, Some(region(0, 6))).is_err());
+    }
+
+    fn fingerprint_of(image: image::GrayImage) -> Fingerprint {
+        Fingerprint::of(&DynamicImage::ImageLuma8(image))
+    }
+
+    #[test]
+    fn a_blinking_caret_is_not_a_change_but_a_new_panel_is() {
+        let page = image::GrayImage::from_pixel(1920, 1080, image::Luma([240]));
+        let mut with_caret = page.clone();
+        for y in 500..518 {
+            with_caret.put_pixel(900, y, image::Luma([0]));
+        }
+        let mut with_panel = page.clone();
+        for x in 0..400 {
+            for y in 0..300 {
+                with_panel.put_pixel(x, y, image::Luma([40]));
+            }
+        }
+        let page = fingerprint_of(page);
+        assert!(!fingerprint_of(with_caret).differs_from(&page));
+        assert!(fingerprint_of(with_panel).differs_from(&page));
+    }
+
+    #[test]
+    fn capture_times_are_shown_to_the_millisecond() {
+        let moment =
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(86_400_000 + 3_723_045);
+        assert_eq!(clock_time(moment), "01:02:03.045 UTC");
+    }
+
+    #[test]
+    fn a_dense_page_with_slightly_uneven_baselines_is_read_without_panicking() {
+        let mut tsv = String::from("header\n");
+        for index in 0..400u32 {
+            let top = index / 2 + (index % 7);
+            let left = (index * 37) % 1800;
+            tsv.push_str(&tsv_row(left, top, 30, 10, 90, &format!("w{index}")));
+            tsv.push('\n');
+        }
+        tsv.push_str(&tsv_row(900, 600, 40, 10, 95, "History"));
+        tsv.push('\n');
+
+        let found = matches_in_tsv(&tsv, "history");
+
+        assert_eq!(found.len(), 1);
+        assert_near((found[0].center_x, found[0].center_y), (920, 605));
+    }
+
+    #[test]
+    fn words_on_one_line_are_read_left_to_right_despite_uneven_baselines() {
+        let tsv = [
+            "header".to_owned(),
+            tsv_row(200, 102, 40, 12, 90, "File"),
+            tsv_row(100, 100, 40, 12, 90, "Open"),
+            tsv_row(150, 104, 40, 12, 90, "the"),
+        ]
+        .join("\n");
+
+        assert_eq!(matches_in_tsv(&tsv, "open the file").len(), 1);
     }
 }

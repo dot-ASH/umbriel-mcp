@@ -60,7 +60,9 @@ pub fn windows() -> Result<Vec<Value>> {
 pub struct WindowPlacement {
     pub geometry: String,
     pub origin: (i64, i64),
+    pub size: (i64, i64),
     pub shown_on_screen: bool,
+    pub title: Option<String>,
 }
 
 pub fn window_placement(window_id: &str) -> Result<WindowPlacement> {
@@ -76,12 +78,18 @@ pub fn window_placement(window_id: &str) -> Result<WindowPlacement> {
             .ok_or_else(|| anyhow!("window {window_id} has no {key}"))
     };
     let (x, y) = (number("x")?, number("y")?);
+    let (width, height) = (number("w")?, number("h")?);
     Ok(WindowPlacement {
-        geometry: format!("{x},{y} {}x{}", number("w")?, number("h")?),
+        geometry: format!("{x},{y} {width}x{height}"),
         origin: (x, y),
+        size: (width, height),
         shown_on_screen: matching
             .get("visible")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        title: matching
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }

@@ -48,6 +48,8 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("screenshot", Access::Observe),
     ("screenshot_with_ocr", Access::Observe),
     ("find_text_on_screen", Access::Observe),
+    ("wait_for_text", Access::Observe),
+    ("wait_for_change", Access::Observe),
     ("clipboard_read", Access::Observe),
     ("start_recording", Access::Observe),
     ("stop_recording", Access::Observe),
