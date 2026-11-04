@@ -9,6 +9,7 @@ mod keyboard;
 mod profile;
 mod recording;
 mod register;
+mod rules;
 mod screen;
 mod setting;
 mod update;
@@ -35,6 +36,40 @@ fn failed(error: anyhow::Error) -> ErrorData {
 
 fn as_pretty_json(value: serde_json::Value) -> Result<String, ErrorData> {
     serde_json::to_string_pretty(&value).map_err(|cause| failed(cause.into()))
+}
+
+const DEFAULT_KEPT_BACKUPS: u32 = 5;
+const FOCUS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const FOCUS_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn focused_window_id() -> Option<String> {
+    ipc::query("focused-window")
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn wait_for_keyboard_focus(window_id: &str) -> anyhow::Result<String> {
+    let deadline = std::time::Instant::now() + FOCUS_WAIT;
+    loop {
+        let focused = focused_window_id();
+        if focused.as_deref() == Some(window_id) {
+            return Ok(format!("ok: {window_id} now has keyboard focus"));
+        }
+        if std::time::Instant::now() >= deadline {
+            let holder = focused
+                .map(|id| format!("window {id} still has it"))
+                .unwrap_or_else(|| "no window has it".to_owned());
+            return Err(anyhow::anyhow!(
+                "window {window_id} did not receive keyboard focus within {} seconds ({holder}). \
+                 The screen may be locked, or a menu, dialog or panel may be holding focus; \
+                 typing now would not reach {window_id}.",
+                FOCUS_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(FOCUS_POLL);
+    }
 }
 
 fn acted(action: String) -> Result<String, ErrorData> {
@@ -241,6 +276,34 @@ struct OptionKey {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct NewRule {
+    /// Rule list: window_rule, layer_rule, workspace, scratchpad, input.device or
+    /// security_context_rule
+    list: String,
+    /// The rule as a JSON object, such as {"match": {"app_id": "^mpv$"}, "default_floating": true};
+    /// config_options with the list name as query shows the fields
+    rule: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReplacedRule {
+    /// Rule list, such as window_rule
+    list: String,
+    /// Which entry, counting from 1 in the order read_config shows them
+    position: usize,
+    /// The complete new rule as a JSON object; it replaces the whole entry
+    rule: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RulePosition {
+    /// Rule list, such as window_rule
+    list: String,
+    /// Which entry, counting from 1 in the order read_config shows them
+    position: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ConfirmationCode {
     /// Confirmation code returned with the previewed change
     confirmation: String,
@@ -268,6 +331,7 @@ struct LayoutRequest {
 #[derive(Clone)]
 struct UmbrielServer {
     profile: Profile,
+    keep_backups: usize,
     pending_changes: Arc<approval::PendingChanges>,
     recorder: Arc<recording::Recorder>,
 }
@@ -332,9 +396,10 @@ fn recording_area(
 }
 
 impl UmbrielServer {
-    fn new(profile: Profile) -> Self {
+    fn new(profile: Profile, keep_backups: u32) -> Self {
         Self {
             profile,
+            keep_backups: keep_backups as usize,
             pending_changes: Arc::default(),
             recorder: Arc::default(),
         }
@@ -434,12 +499,29 @@ impl UmbrielServer {
         }
     }
 
+    fn permit_rule(
+        &self,
+        tool: &str,
+        list: &str,
+        fields: &[(String, toml_edit::Value)],
+    ) -> Result<(), ErrorData> {
+        match rules::needs_full_profile(list.trim(), fields) {
+            Some(reason) if self.profile < Profile::Full => Err(refused(format!(
+                "`{tool}` cannot change this {} rule in the `{}` profile: {reason}. Restart \
+                 umbriel-mcp with `--profile full` to allow it.",
+                list.trim(),
+                self.profile
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     async fn approve_and_write(
         &self,
         peer: &Peer<RoleServer>,
         change: config_edit::PreparedChange,
     ) -> Result<String, ErrorData> {
-        approval::ask_then_commit(peer, &self.pending_changes, change)
+        approval::ask_then_commit(peer, &self.pending_changes, change, self.keep_backups)
             .await
             .map_err(failed)
     }
@@ -510,8 +592,10 @@ impl UmbrielServer {
         acted(format!("workspace-switch:{selector}"))
     }
 
-    #[tool(description = "Focus a window by id, optionally warping the pointer onto it.")]
-    fn focus_window(
+    #[tool(
+        description = "Focus a window by id, optionally warping the pointer onto it. Returns only once the window has keyboard focus, so typing right after goes to it; fails if focus does not move (for example while the screen is locked)."
+    )]
+    async fn focus_window(
         &self,
         Parameters(target): Parameters<FocusTarget>,
     ) -> Result<String, ErrorData> {
@@ -520,7 +604,12 @@ impl UmbrielServer {
         } else {
             "window-focus"
         };
-        acted(format!("{verb}:{}", target.window_id))
+        let window_id = target.window_id.trim().to_owned();
+        ipc::dispatch(&format!("{verb}:{window_id}")).map_err(failed)?;
+        let waited = tokio::task::spawn_blocking(move || wait_for_keyboard_focus(&window_id))
+            .await
+            .map_err(|error| failed(anyhow::anyhow!("the focus check failed: {error}")))?;
+        waited.map_err(failed)
     }
 
     #[tool(description = "Ask a window to close; acts on the focused window when no id is given.")]
@@ -917,6 +1006,56 @@ impl UmbrielServer {
     }
 
     #[tool(
+        description = "Add a rule to one of Umbriel's rule lists (window_rule, layer_rule, workspace, scratchpad, input.device, security_context_rule) in the user's config. Fields are checked against Umbriel's schema and the config with `umbriel config validate`; the change is only written after the user approves it, and they choose whether to keep a backup.",
+        annotations(destructive_hint = true)
+    )]
+    async fn add_rule(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<NewRule>,
+    ) -> Result<String, ErrorData> {
+        let fields = rules::fields_for(&request.list, &request.rule).map_err(failed)?;
+        self.permit_rule("add_rule", &request.list, &fields)?;
+        match rules::prepare_add(request.list.trim(), fields).map_err(failed)? {
+            Some(change) => self.approve_and_write(&peer, change).await,
+            None => Ok("that rule would not change the config; nothing changed".to_owned()),
+        }
+    }
+
+    #[tool(
+        description = "Replace one rule in a rule list of the user's Umbriel config with a complete new rule. Use read_config first to see the entries; position counts from 1. Only written after the user approves it, and they choose whether to keep a backup.",
+        annotations(destructive_hint = true)
+    )]
+    async fn replace_rule(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<ReplacedRule>,
+    ) -> Result<String, ErrorData> {
+        let fields = rules::fields_for(&request.list, &request.rule).map_err(failed)?;
+        self.permit_rule("replace_rule", &request.list, &fields)?;
+        match rules::prepare_replace(request.list.trim(), request.position, fields)
+            .map_err(failed)?
+        {
+            Some(change) => self.approve_and_write(&peer, change).await,
+            None => Ok("the new rule is identical to the old one; nothing changed".to_owned()),
+        }
+    }
+
+    #[tool(
+        description = "Remove one rule from a rule list of the user's Umbriel config. Use read_config first to see the entries; position counts from 1. Only written after the user approves it, and they choose whether to keep a backup.",
+        annotations(destructive_hint = true)
+    )]
+    async fn remove_rule(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<RulePosition>,
+    ) -> Result<String, ErrorData> {
+        self.permit_rule("remove_rule", &request.list, &[])?;
+        let change = rules::prepare_remove(&request.list, request.position).map_err(failed)?;
+        self.approve_and_write(&peer, change).await
+    }
+
+    #[tool(
         description = "Write a config change that the user has explicitly approved, using the confirmation code a config tool returned. Only call this after showing the user the change and getting their yes; never approve on their behalf.",
         annotations(destructive_hint = true)
     )]
@@ -931,7 +1070,14 @@ impl UmbrielServer {
         let keep_backup = request
             .backup
             .unwrap_or_else(approval::keep_backup_unless_told_otherwise);
-        config_edit::commit(&change, keep_backup).map_err(failed)
+        config_edit::commit(
+            &change,
+            config_edit::BackupPolicy {
+                keep_backup,
+                keep_newest: self.keep_backups,
+            },
+        )
+        .map_err(failed)
     }
 
     #[tool(
@@ -1030,7 +1176,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, and keybinds with set_keybind and remove_keybind, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, keybinds with set_keybind and remove_keybind, and rule lists such as window_rule with add_rule, replace_rule and remove_rule, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(
@@ -1054,6 +1200,11 @@ struct Cli {
     /// window control but cannot start programs, full allows everything
     #[arg(long, value_enum, default_value_t = Profile::Full)]
     profile: Profile,
+
+    /// How many config backups to keep; older umbriel-mcp backups are deleted when a new one is
+    /// written
+    #[arg(long, default_value_t = DEFAULT_KEPT_BACKUPS, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    keep_backups: u32,
 }
 
 #[derive(clap::Subcommand)]
@@ -1084,7 +1235,9 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
         None => {}
     }
-    let service = UmbrielServer::new(cli.profile).serve(stdio()).await?;
+    let service = UmbrielServer::new(cli.profile, cli.keep_backups)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -1098,10 +1251,11 @@ mod tests {
 
     #[test]
     fn the_registration_summary_is_the_first_line_of_the_server_instructions() {
-        let instructions = UmbrielServer::new(crate::profile::Profile::Full)
-            .get_info()
-            .instructions
-            .expect("server instructions");
+        let instructions =
+            UmbrielServer::new(crate::profile::Profile::Full, super::DEFAULT_KEPT_BACKUPS)
+                .get_info()
+                .instructions
+                .expect("server instructions");
 
         assert_eq!(instructions.lines().next(), Some(SERVER_SUMMARY));
     }

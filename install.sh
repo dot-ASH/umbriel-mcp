@@ -6,6 +6,10 @@ releases="${releases%/}"
 install_dir="${UMBRIEL_MCP_INSTALL_DIR:-$HOME/.local/bin}"
 target="$install_dir/umbriel-mcp"
 
+release_key='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAb6vD24XeZrULn45eFBX1DOtynS2RdegYIHF9FZw5MYo=
+-----END PUBLIC KEY-----'
+
 fail() {
   echo "umbriel-mcp install: $*" >&2
   exit 1
@@ -17,7 +21,7 @@ case "$(uname -m)" in
   *) fail "no build for $(uname -m); releases exist for x86_64 and aarch64 Linux" ;;
 esac
 
-for tool in curl tar sha256sum; do
+for tool in curl tar sha256sum openssl; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is needed; install it with your package manager"
 done
 
@@ -26,6 +30,17 @@ trap 'rm -rf "$work"' EXIT INT TERM
 
 curl -fsSL "$releases/latest/download/SHA256SUMS" -o "$work/SHA256SUMS" ||
   fail "could not download the release checksums from $releases"
+curl -fsSL "$releases/latest/download/SHA256SUMS.sig" -o "$work/SHA256SUMS.sig" ||
+  fail "the latest release is not signed (it has no SHA256SUMS.sig); nothing was installed"
+
+if [ -n "${UMBRIEL_MCP_RELEASE_KEY:-}" ]; then
+  cp "$UMBRIEL_MCP_RELEASE_KEY" "$work/release-key.pem"
+else
+  printf '%s\n' "$release_key" >"$work/release-key.pem"
+fi
+openssl pkeyutl -verify -pubin -inkey "$work/release-key.pem" -rawin \
+  -in "$work/SHA256SUMS" -sigfile "$work/SHA256SUMS.sig" >/dev/null 2>&1 ||
+  fail "the release signature does not match the release signing key, so the release may have been tampered with; nothing was installed"
 
 asset="$(awk -v suffix="-$arch-linux.tar.gz" '
   substr($2, 1, 13) == "umbriel-mcp-v" && substr($2, length($2) - length(suffix) + 1) == suffix { print $2; exit }

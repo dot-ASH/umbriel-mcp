@@ -4,6 +4,24 @@ Publishing to crates.io, the MCP Registry, and the AUR is manual. The release wo
 builds binaries, writes `SHA256SUMS`, and creates the GitHub Release; it holds no registry
 credentials. Every command below works in bash, zsh, and fish.
 
+## 0. One-time: the release signing key
+
+Releases are signed so that `umbriel-mcp update` and `install.sh` can tell a genuine release
+from a tampered one. The private key was generated on the maintainer's machine at
+`~/.local/share/umbriel-mcp/release-signing/private-key.pem`; its public half is
+`release-signing-key.pem` in this repository, and the same key is embedded in `install.sh`
+(`tests/release_metadata.rs` checks they match).
+
+1. Back up the private key somewhere safe and offline. If it is lost, releases cannot be signed
+   with it again: a new key means shipping a new public key, and installed binaries only trust
+   the key they were built with.
+2. Add it to GitHub: repository Settings → Secrets and variables → Actions → New repository
+   secret, name `RELEASE_SIGNING_KEY`, value: the whole contents of `private-key.pem`, including
+   the BEGIN and END lines.
+
+The release workflow refuses to publish without that secret, and checks each signature against
+`release-signing-key.pem` before uploading `SHA256SUMS.sig`.
+
 ## 1. Bump the version
 
 Set the new version `X.Y.Z` in all of these:

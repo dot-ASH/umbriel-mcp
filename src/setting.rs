@@ -63,8 +63,8 @@ fn segments_match(path: &str, key: &str) -> Option<bool> {
 
 fn rule_list_error(key: &str) -> anyhow::Error {
     anyhow!(
-        "`{key}` belongs to a rule list (such as window_rule); editing rule lists is not supported \
-         yet. Read it with read_config and change it by hand."
+        "`{key}` belongs to a rule list (such as window_rule); use add_rule, replace_rule or \
+         remove_rule for rule lists"
     )
 }
 

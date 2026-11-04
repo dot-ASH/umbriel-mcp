@@ -1,261 +1,9 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
-
-struct FakeUmbriel {
-    path: PathBuf,
-    requests: Arc<Mutex<Vec<Value>>>,
-    running: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl FakeUmbriel {
-    fn start(replies: HashMap<String, Value>) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "umbriel-mcp-test-{}-{}.sock",
-            std::process::id(),
-            unique_suffix()
-        ));
-        let listener = UnixListener::bind(&path).expect("bind fake compositor socket");
-        listener
-            .set_nonblocking(true)
-            .expect("set fake compositor socket nonblocking");
-
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let running = Arc::new(AtomicBool::new(true));
-        let worker_requests = Arc::clone(&requests);
-        let worker_running = Arc::clone(&running);
-        let worker = thread::spawn(move || {
-            while worker_running.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => handle_fake_request(stream, &replies, &worker_requests),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self {
-            path,
-            requests,
-            running,
-            worker: Some(worker),
-        }
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        self.requests.lock().expect("fake request lock").clone()
-    }
-}
-
-impl Drop for FakeUmbriel {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        let _ = UnixStream::connect(&self.path);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn unique_suffix() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos()
-    )
-}
-
-fn handle_fake_request(
-    stream: UnixStream,
-    replies: &HashMap<String, Value>,
-    requests: &Arc<Mutex<Vec<Value>>>,
-) {
-    let mut stream = BufReader::new(stream);
-    let mut line = String::new();
-    if stream.read_line(&mut line).is_err() || line.is_empty() {
-        return;
-    }
-
-    let Ok(request) = serde_json::from_str::<Value>(&line) else {
-        return;
-    };
-    requests
-        .lock()
-        .expect("fake request lock")
-        .push(request.clone());
-
-    let command = request
-        .get("cmd")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let response = replies
-        .get(command)
-        .cloned()
-        .unwrap_or_else(|| json!({"ok": []}));
-    let mut stream = stream.into_inner();
-    let _ = writeln!(stream, "{response}");
-}
-
-struct McpProcess {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    next_id: u64,
-    approval_reply: Option<Value>,
-    approval_questions: Vec<String>,
-    approval_forms: Vec<Value>,
-}
-
-impl McpProcess {
-    fn start(socket_path: &std::path::Path) -> Self {
-        Self::start_with_args(socket_path, &[])
-    }
-
-    fn start_with_profile(socket_path: &std::path::Path, profile: &str) -> Self {
-        Self::start_with_args(socket_path, &["--profile", profile])
-    }
-
-    fn start_with_args(socket_path: &std::path::Path, args: &[&str]) -> Self {
-        Self::start_with_environment(socket_path, args, &[])
-    }
-
-    fn start_with_environment(
-        socket_path: &std::path::Path,
-        args: &[&str],
-        environment: &[(&str, &std::ffi::OsStr)],
-    ) -> Self {
-        Self::start_as_client(socket_path, args, environment, json!({}), None)
-    }
-
-    fn start_as_client(
-        socket_path: &std::path::Path,
-        args: &[&str],
-        environment: &[(&str, &std::ffi::OsStr)],
-        capabilities: Value,
-        approval_reply: Option<Value>,
-    ) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
-            .args(args)
-            .envs(environment.iter().copied())
-            .env("UMBRIEL_SOCKET", socket_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start MCP server binary");
-        let input = child.stdin.take().expect("MCP server stdin");
-        let output = BufReader::new(child.stdout.take().expect("MCP server stdout"));
-        let mut process = Self {
-            child,
-            input,
-            output,
-            next_id: 1,
-            approval_reply,
-            approval_questions: Vec::new(),
-            approval_forms: Vec::new(),
-        };
-
-        let initialized = process.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": capabilities,
-                "clientInfo": { "name": "contract-test", "version": "1" }
-            }),
-        );
-        assert_eq!(initialized["result"]["serverInfo"]["name"], "umbriel-mcp");
-        process.notify("notifications/initialized", json!({}));
-        process
-    }
-
-    fn notify(&mut self, method: &str, params: Value) {
-        let message = json!({"jsonrpc":"2.0", "method":method, "params":params});
-        writeln!(self.input, "{message}").expect("write MCP notification");
-        self.input.flush().expect("flush MCP notification");
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        let message = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
-        writeln!(self.input, "{message}").expect("write MCP request");
-        self.input.flush().expect("flush MCP request");
-
-        loop {
-            let mut line = String::new();
-            self.output.read_line(&mut line).expect("read MCP response");
-            assert!(!line.is_empty(), "MCP server closed stdout unexpectedly");
-            let response: Value = serde_json::from_str(&line).expect("MCP response JSON");
-            if response.get("method").is_some() {
-                self.answer_server_request(&response);
-                continue;
-            }
-            if response.get("id").and_then(Value::as_u64) == Some(id) {
-                return response;
-            }
-        }
-    }
-
-    fn answer_server_request(&mut self, request: &Value) {
-        let Some(request_id) = request.get("id") else {
-            return;
-        };
-        let result = if request["method"] == "elicitation/create" {
-            self.approval_forms
-                .push(request["params"]["requestedSchema"].clone());
-            self.approval_questions.push(
-                request["params"]["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
-            self.approval_reply
-                .clone()
-                .unwrap_or_else(|| json!({"action": "cancel"}))
-        } else {
-            json!({})
-        };
-        let message = json!({"jsonrpc":"2.0", "id": request_id, "result": result});
-        writeln!(self.input, "{message}").expect("answer server request");
-        self.input.flush().expect("flush answer");
-    }
-
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.request("tools/call", json!({"name":name, "arguments":arguments}))
-    }
-}
-
-impl Drop for McpProcess {
-    fn drop(&mut self) {
-        let _ = self.input.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn text_content(response: &Value) -> String {
-    response["result"]["content"]
-        .as_array()
-        .expect("tool result content")
-        .iter()
-        .filter_map(|block| block["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use std::process::{Command, Stdio};
+use support::{FakeUmbriel, Focus, McpProcess, error_message, text_content};
 
 fn canned_replies() -> HashMap<String, Value> {
     HashMap::from([
@@ -414,13 +162,6 @@ fn compositor_actions(fake: &FakeUmbriel) -> Vec<String> {
         .filter(|request| request["cmd"] == "msg")
         .filter_map(|request| request["arg"].as_str().map(str::to_owned))
         .collect()
-}
-
-fn error_message(response: &Value) -> String {
-    response["error"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected an error response, got {response}"))
-        .to_owned()
 }
 
 fn assert_refused_by_profile(response: &Value, profile: &str) {
@@ -664,13 +405,7 @@ fn fake_tools_directory(
     tesseract_script: Option<&str>,
 ) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "umbriel-ocr-tools-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&directory).expect("create fake tools directory");
+    let directory = support::scratch_directory("tools");
     for (name, script) in [("grim", grim_script), ("tesseract", tesseract_script)] {
         if let Some(script) = script {
             let path = directory.join(name);
@@ -1014,7 +749,7 @@ Workspaces
   workspace-next               Switch to the next workspace
 HELP
   ;;
-  "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout","type":"table"},{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true},{"path":"general.autostart","type":"string_array","default":[]},{"path":"hot_corners.top_left.action","type":"string","format":"action"},{"path":"output.<name>.enabled","type":"bool","default":true},{"path":"input.keyboard.layout","type":"string","default":""},{"path":"keybinds.<name>","type":"string_or_table","format":"action"},{"path":"window_rule","type":"array_of_tables"}]}' ;;
+  "config schema --json") echo '{"version":"9.9.9","options":[{"path":"layout","type":"table"},{"path":"layout.gap","type":"int","min":0,"max":500,"default":8},{"path":"appearance.blur.enabled","type":"bool","default":true},{"path":"general.autostart","type":"string_array","default":[]},{"path":"hot_corners.top_left.action","type":"string","format":"action"},{"path":"output.<name>.enabled","type":"bool","default":true},{"path":"input.keyboard.layout","type":"string","default":""},{"path":"keybinds.<name>","type":"string_or_table","format":"action"},{"path":"window_rule","type":"array_of_tables"},{"path":"window_rule[].match","type":"table"},{"path":"window_rule[].match.app_id","type":"string_or_string_array","format":"regex"},{"path":"window_rule[].default_floating","type":"bool"},{"path":"window_rule[].opacity","type":"float","min":0.0,"max":1.0},{"path":"scratchpad","type":"array_of_tables"},{"path":"scratchpad[].name","type":"string"},{"path":"scratchpad[].spawn_when_empty","type":"string","default":""},{"path":"security_context_rule","type":"array_of_tables"},{"path":"security_context_rule[].allow_globals","type":"string_array","default":[]},{"path":"input.device","type":"array_of_tables"},{"path":"input.device[].name","type":"string"},{"path":"input.device[].enabled","type":"bool"}]}' ;;
   "config validate -c "*)
     if grep -q "no-such-action" "$4"; then
       printf '12:00:00.000 [\033[33mWRN\033[0m] [config] %s:3:1: ignoring keybind\n' "$4"
@@ -1486,6 +1221,15 @@ fn start_editor(
     outputs: Value,
     approval_reply: Option<Value>,
 ) -> (FakeUmbriel, McpProcess) {
+    start_editor_with_args(home, &["--profile", profile], outputs, approval_reply)
+}
+
+fn start_editor_with_args(
+    home: &std::path::Path,
+    args: &[&str],
+    outputs: Value,
+    approval_reply: Option<Value>,
+) -> (FakeUmbriel, McpProcess) {
     let mut replies = compositor_state_replies();
     replies.insert("outputs".to_string(), json!({ "ok": outputs }));
     let fake = FakeUmbriel::start(replies);
@@ -1499,7 +1243,7 @@ fn start_editor(
     };
     let server = McpProcess::start_as_client(
         &fake.path,
-        &["--profile", profile],
+        args,
         &[
             ("PATH", path.as_ref()),
             ("HOME", home.as_os_str()),
@@ -1760,6 +1504,9 @@ fn every_config_write_tool_is_marked_destructive() {
         "set_keybind",
         "remove_keybind",
         "apply_config_change",
+        "add_rule",
+        "replace_rule",
+        "remove_rule",
     ] {
         let tool = tools["result"]["tools"]
             .as_array()
@@ -2288,4 +2035,330 @@ fn a_short_recording_stops_by_itself() {
     let message = error_message(&after);
     assert!(message.contains("reached its time limit"), "{message}");
     assert_eq!(desktop.recordings().len(), 1);
+}
+
+fn focus_desktop(focus: Focus) -> (FakeUmbriel, McpProcess) {
+    let mut replies = canned_replies();
+    replies.insert(
+        "focused-window".to_string(),
+        json!({"ok": {"id": "window-a", "active": true, "focused": true}}),
+    );
+    let fake = FakeUmbriel::start_with_focus(replies, focus);
+    let server = McpProcess::start(&fake.path);
+    (fake, server)
+}
+
+#[test]
+fn focus_window_returns_once_the_window_has_keyboard_focus() {
+    let (_fake, mut server) = focus_desktop(Focus::Immediate);
+
+    let response = server.call_tool("focus_window", json!({"window_id":"window-b"}));
+
+    assert!(
+        text_content(&response).contains("window-b now has keyboard focus"),
+        "{response}"
+    );
+}
+
+#[test]
+fn focus_window_waits_for_focus_that_arrives_late() {
+    let (_fake, mut server) = focus_desktop(Focus::After(std::time::Duration::from_millis(400)));
+
+    let started = std::time::Instant::now();
+    let response = server.call_tool("focus_window", json!({"window_id":"window-b"}));
+
+    assert!(
+        text_content(&response).contains("now has keyboard focus"),
+        "{response}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn focus_that_never_arrives_is_reported_as_an_error() {
+    let (_fake, mut server) = focus_desktop(Focus::Never);
+
+    let response = server.call_tool("focus_window", json!({"window_id":"window-b"}));
+
+    let message = error_message(&response);
+    assert!(
+        message.contains("window-b did not receive keyboard focus"),
+        "{message}"
+    );
+    assert!(message.contains("locked"), "{message}");
+    assert!(
+        message.contains("window-a"),
+        "should name the window that still has focus: {message}"
+    );
+}
+
+#[test]
+fn focusing_the_already_focused_window_returns_at_once() {
+    let (_fake, mut server) = focus_desktop(Focus::Never);
+
+    let response = server.call_tool("focus_window", json!({"window_id":"window-a"}));
+
+    assert!(
+        text_content(&response).contains("window-a now has keyboard focus"),
+        "{response}"
+    );
+}
+
+fn plant_old_backups(home: &std::path::Path, stamps: &[u64]) {
+    for stamp in stamps {
+        std::fs::write(
+            home.join(format!(".config/umbriel/config.toml.bak-{stamp}")),
+            format!("old backup {stamp}"),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn writing_a_backup_prunes_all_but_the_newest_five_by_default() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    plant_old_backups(
+        &home,
+        &[
+            1_000_000_001,
+            1_000_000_002,
+            1_000_000_003,
+            1_000_000_004,
+            1_000_000_005,
+            1_000_000_006,
+        ],
+    );
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let applied = call_and_approve(
+        &mut server,
+        "set_option",
+        json!({"key":"layout.gap","value":12}),
+    );
+
+    let remaining = files_beside_config(&home);
+    assert_eq!(backups(&home), 5, "{remaining:?}");
+    for pruned in ["config.toml.bak-1000000001", "config.toml.bak-1000000002"] {
+        assert!(!remaining.contains(&pruned.to_owned()), "{remaining:?}");
+    }
+    assert!(remaining.contains(&"config.toml.bak-1000000006".to_owned()));
+    assert!(
+        text_content(&applied).contains("Removed 2 older backups"),
+        "{applied}"
+    );
+}
+
+#[test]
+fn the_backup_limit_can_be_raised() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    plant_old_backups(
+        &home,
+        &[
+            1_000_000_001,
+            1_000_000_002,
+            1_000_000_003,
+            1_000_000_004,
+            1_000_000_005,
+            1_000_000_006,
+        ],
+    );
+    let (_fake, mut server) =
+        start_editor_with_args(&home, &["--keep-backups", "20"], two_outputs(), None);
+
+    call_and_approve(
+        &mut server,
+        "set_option",
+        json!({"key":"layout.gap","value":12}),
+    );
+
+    assert_eq!(backups(&home), 7);
+}
+
+#[test]
+fn declining_a_backup_leaves_existing_backups_alone() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    plant_old_backups(
+        &home,
+        &[
+            1_000_000_001,
+            1_000_000_002,
+            1_000_000_003,
+            1_000_000_004,
+            1_000_000_005,
+            1_000_000_006,
+        ],
+    );
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": confirmation_code(&previewed).unwrap(), "backup": false}),
+    );
+
+    assert_eq!(backups(&home), 6);
+}
+
+#[test]
+fn a_backup_limit_of_zero_is_refused_at_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
+        .args(["--keep-backups", "0"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+}
+
+const RULES_CONFIG: &str = "[general]\nxwayland = true\n\n[[window_rule]]\nmatch.app_id = \"^pavucontrol$\"\ndefault_floating = true\n\n[[security_context_rule]]\nallow_globals = [\"wl_shm\"]\n";
+
+#[test]
+fn a_window_rule_is_added_after_approval() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool(
+        "add_rule",
+        json!({"list":"window_rule","rule":{"match":{"app_id":"^mpv$"},"default_floating":true}}),
+    );
+    let preview = text_content(&previewed);
+    assert!(
+        preview.contains("Add window_rule #2: match.app_id = \"^mpv$\", default_floating = true"),
+        "{preview}"
+    );
+    assert_eq!(
+        current_config(&home),
+        RULES_CONFIG,
+        "nothing is written before approval"
+    );
+
+    server.call_tool(
+        "apply_config_change",
+        json!({"confirmation": confirmation_code(&previewed).unwrap()}),
+    );
+    let config = current_config(&home);
+    assert_eq!(config.matches("[[window_rule]]").count(), 2, "{config}");
+    assert!(config.contains("match.app_id = \"^mpv$\""), "{config}");
+}
+
+#[test]
+fn a_window_rule_is_replaced_and_removed_by_position() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let replaced = call_and_approve(
+        &mut server,
+        "replace_rule",
+        json!({"list":"window_rule","position":1,"rule":{"match":{"app_id":"^pavucontrol$"},"opacity":0.9}}),
+    );
+    assert!(
+        text_content(&replaced).contains("Applied: Replace window_rule #1"),
+        "{replaced}"
+    );
+    assert!(current_config(&home).contains("opacity = 0.9"));
+
+    let removed = call_and_approve(
+        &mut server,
+        "remove_rule",
+        json!({"list":"window_rule","position":1}),
+    );
+    assert!(
+        text_content(&removed).contains("Applied: Remove window_rule #1"),
+        "{removed}"
+    );
+    assert!(!current_config(&home).contains("[[window_rule]]"));
+}
+
+#[test]
+fn rule_mistakes_are_explained_before_anything_is_asked() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let bad_field = server.call_tool(
+        "add_rule",
+        json!({"list":"window_rule","rule":{"floating":true}}),
+    );
+    let bad_value = server.call_tool(
+        "add_rule",
+        json!({"list":"window_rule","rule":{"opacity":3}}),
+    );
+    let bad_list = server.call_tool("add_rule", json!({"list":"layout","rule":{"gap":1}}));
+    let bad_position = server.call_tool("remove_rule", json!({"list":"window_rule","position":5}));
+
+    assert!(
+        error_message(&bad_field).contains("not a window_rule field"),
+        "{bad_field}"
+    );
+    assert!(
+        error_message(&bad_value).contains("must be between"),
+        "{bad_value}"
+    );
+    assert!(
+        error_message(&bad_list).contains("not a rule list"),
+        "{bad_list}"
+    );
+    assert!(
+        error_message(&bad_position).contains("has 1 window_rule entries"),
+        "{bad_position}"
+    );
+    assert_eq!(current_config(&home), RULES_CONFIG);
+}
+
+#[test]
+fn no_exec_refuses_security_rules_and_scratchpads_that_spawn() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "no-exec", two_outputs(), None);
+
+    let security = server.call_tool(
+        "remove_rule",
+        json!({"list":"security_context_rule","position":1}),
+    );
+    let spawning = server.call_tool(
+        "add_rule",
+        json!({"list":"scratchpad","rule":{"name":"term","spawn_when_empty":"foot"}}),
+    );
+    let plain = server.call_tool(
+        "add_rule",
+        json!({"list":"scratchpad","rule":{"name":"term"}}),
+    );
+
+    assert_refused_by_profile(&security, "no-exec");
+    assert_refused_by_profile(&spawning, "no-exec");
+    assert!(confirmation_code(&plain).is_some(), "{plain}");
+}
+
+#[test]
+fn read_only_refuses_rule_edits() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "read-only", two_outputs(), None);
+
+    for (tool, arguments) in [
+        (
+            "add_rule",
+            json!({"list":"window_rule","rule":{"default_floating":true}}),
+        ),
+        (
+            "replace_rule",
+            json!({"list":"window_rule","position":1,"rule":{"default_floating":true}}),
+        ),
+        ("remove_rule", json!({"list":"window_rule","position":1})),
+    ] {
+        assert_refused_by_profile(&server.call_tool(tool, arguments), "read-only");
+    }
+}
+
+#[test]
+fn disabling_an_input_device_carries_a_caution() {
+    let home = home_with_config(RULES_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let previewed = server.call_tool(
+        "add_rule",
+        json!({"list":"input.device","rule":{"name":"AT keyboard","enabled":false}}),
+    );
+
+    assert!(
+        text_content(&previewed).contains("Caution: this disables a device"),
+        "{previewed}"
+    );
 }

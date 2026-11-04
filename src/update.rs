@@ -12,6 +12,9 @@ const ASSET_SUFFIX: &str = "-linux.tar.gz";
 const BINARY: &str = "umbriel-mcp";
 const DOWNLOAD_TIMEOUT_SECONDS: &str = "120";
 const CHECK_TIMEOUT_SECONDS: &str = "10";
+const RELEASE_KEY: &str = include_str!("../release-signing-key.pem");
+#[cfg(debug_assertions)]
+const RELEASE_KEY_OVERRIDE_FOR_TESTS: &str = "UMBRIEL_MCP_RELEASE_KEY";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Release {
@@ -81,6 +84,27 @@ pub fn classify(executable: &Path) -> Installation {
     Installation::SelfManaged
 }
 
+pub fn verify_release_signature(public_key_pem: &str, sums: &[u8], signature: &[u8]) -> Result<()> {
+    let key = ed25519_compact::PublicKey::from_pem(public_key_pem)
+        .map_err(|error| anyhow!("the release signing key is unreadable: {error}"))?;
+    let signature = ed25519_compact::Signature::from_slice(signature)
+        .map_err(|_| anyhow!("the release signature does not match the release signing key"))?;
+    key.verify(sums, &signature).map_err(|_| {
+        anyhow!(
+            "the release signature does not match the release signing key, so the release may \
+             have been tampered with; nothing was changed"
+        )
+    })
+}
+
+fn trusted_release_key() -> Result<String> {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var(RELEASE_KEY_OVERRIDE_FOR_TESTS) {
+        return std::fs::read_to_string(&path).with_context(|| format!("cannot read {path}"));
+    }
+    Ok(RELEASE_KEY.to_owned())
+}
+
 fn releases_base() -> String {
     std::env::var(RELEASES_OVERRIDE)
         .ok()
@@ -111,6 +135,32 @@ fn curl(url: &str, timeout_seconds: &str, destination: Option<&Path>) -> Result<
 fn latest(timeout_seconds: &str) -> Result<(Release, String)> {
     let url = format!("{}/latest/download/SHA256SUMS", releases_base());
     let sums = String::from_utf8_lossy(&curl(&url, timeout_seconds, None)?).into_owned();
+    newest_in(sums)
+}
+
+fn latest_signed() -> Result<(Release, String)> {
+    let base = releases_base();
+    let sums = curl(
+        &format!("{base}/latest/download/SHA256SUMS"),
+        DOWNLOAD_TIMEOUT_SECONDS,
+        None,
+    )?;
+    let signature = curl(
+        &format!("{base}/latest/download/SHA256SUMS.sig"),
+        DOWNLOAD_TIMEOUT_SECONDS,
+        None,
+    )
+    .map_err(|_| {
+        anyhow!(
+            "the latest release is not signed (it has no SHA256SUMS.sig), so it was not \
+             installed; nothing was changed"
+        )
+    })?;
+    verify_release_signature(&trusted_release_key()?, &sums, &signature)?;
+    newest_in(String::from_utf8_lossy(&sums).into_owned())
+}
+
+fn newest_in(sums: String) -> Result<(Release, String)> {
     let release = latest_release(&sums, std::env::consts::ARCH).ok_or_else(|| {
         anyhow!(
             "the latest release has no build for {} Linux",
@@ -271,7 +321,11 @@ fn update(check_only: bool) -> Result<String> {
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .context("cannot find the running umbriel-mcp executable")?;
-    let (release, sums) = latest(DOWNLOAD_TIMEOUT_SECONDS)?;
+    let (release, sums) = if check_only {
+        latest(DOWNLOAD_TIMEOUT_SECONDS)?
+    } else {
+        latest_signed()?
+    };
     let current = env!("CARGO_PKG_VERSION");
     if release.version <= current_version() {
         return Ok(format!("umbriel-mcp {current} is up to date."));
@@ -405,5 +459,26 @@ mod tests {
             unreachable!()
         };
         assert!(advice.contains("cargo install umbriel-mcp"), "{advice}");
+    }
+
+    #[test]
+    fn the_embedded_release_key_is_a_readable_ed25519_key() {
+        assert!(ed25519_compact::PublicKey::from_pem(super::RELEASE_KEY).is_ok());
+    }
+
+    #[test]
+    fn signatures_are_checked_against_the_given_key() {
+        let key_pair = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([7; 32]));
+        let public = key_pair.pk.to_pem();
+        let sums = b"abc  umbriel-mcp-v1.0.0-x86_64-linux.tar.gz\n";
+        let signature = key_pair.sk.sign(sums, None);
+
+        assert!(super::verify_release_signature(&public, sums, signature.as_ref()).is_ok());
+        assert!(super::verify_release_signature(&public, b"changed", signature.as_ref()).is_err());
+        assert!(super::verify_release_signature(&public, sums, &[0; 10]).is_err());
+        let other = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([8; 32]));
+        assert!(
+            super::verify_release_signature(&other.pk.to_pem(), sums, signature.as_ref()).is_err()
+        );
     }
 }

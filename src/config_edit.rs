@@ -191,6 +191,50 @@ pub fn remove_keeping_comments_above(table: &mut dyn TableLike, key: &str) -> Op
     removed
 }
 
+fn backup_order(name: &str, config_name: &str) -> Option<(u64, u64)> {
+    let stamp = name.strip_prefix(config_name)?.strip_prefix(".bak-")?;
+    let digits = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+    };
+    match stamp.split_once('-') {
+        Some((seconds, attempt)) => Some((digits(seconds)?, digits(attempt)?)),
+        None => Some((digits(stamp)?, 1)),
+    }
+}
+
+pub fn next_backup_attempt(names: &[String], config_name: &str, stamp: u64) -> u64 {
+    names
+        .iter()
+        .filter_map(|name| backup_order(name, config_name))
+        .filter(|(seconds, _)| *seconds == stamp)
+        .map(|(_, attempt)| attempt + 1)
+        .max()
+        .unwrap_or(1)
+}
+
+pub fn backups_to_remove(
+    names: &[String],
+    config_name: &str,
+    keep_newest: usize,
+    just_written: &str,
+) -> Vec<String> {
+    let mut backups: Vec<(u64, u64, &String)> = names
+        .iter()
+        .filter(|name| name.as_str() != just_written)
+        .filter_map(|name| {
+            backup_order(name, config_name).map(|(seconds, attempt)| (seconds, attempt, name))
+        })
+        .collect();
+    backups.sort_unstable_by_key(|(seconds, attempt, _)| std::cmp::Reverse((*seconds, *attempt)));
+    backups
+        .into_iter()
+        .skip(keep_newest.saturating_sub(1))
+        .map(|(_, _, name)| name.clone())
+        .collect()
+}
+
 pub fn changed_lines(before: &str, after: &str) -> String {
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
@@ -348,10 +392,32 @@ fn sibling(config_file: &Path, suffix: &str) -> PathBuf {
     config_file.with_file_name(format!("{name}{suffix}"))
 }
 
+fn names_beside(config_file: &Path) -> Vec<String> {
+    config_file
+        .parent()
+        .map(|folder| {
+            std::fs::read_dir(folder)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn config_name(config_file: &Path) -> String {
+    config_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn write_new_backup(config_file: &Path, original: &str) -> Result<PathBuf> {
     use std::io::Write as _;
     let stamp = unix_seconds();
-    for attempt in 1.. {
+    let first = next_backup_attempt(&names_beside(config_file), &config_name(config_file), stamp);
+    for attempt in first.. {
         let suffix = if attempt == 1 {
             format!(".bak-{stamp}")
         } else {
@@ -471,7 +537,33 @@ pub fn prepare(
     }))
 }
 
-pub fn commit(prepared: &PreparedChange, keep_backup: bool) -> Result<String> {
+#[derive(Clone, Copy, Debug)]
+pub struct BackupPolicy {
+    pub keep_backup: bool,
+    pub keep_newest: usize,
+}
+
+fn prune_backups(config_file: &Path, just_written: &Path, keep_newest: usize) -> usize {
+    let Some(folder) = config_file.parent() else {
+        return 0;
+    };
+    let just_written = just_written
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    backups_to_remove(
+        &names_beside(config_file),
+        &config_name(config_file),
+        keep_newest,
+        &just_written,
+    )
+    .iter()
+    .filter(|name| std::fs::remove_file(folder.join(name)).is_ok())
+    .count()
+}
+
+pub fn commit(prepared: &PreparedChange, policy: BackupPolicy) -> Result<String> {
+    let keep_backup = policy.keep_backup;
     let config_file = &prepared.config_file;
     let current = std::fs::read_to_string(config_file)
         .with_context(|| format!("cannot read {}", config_file.display()))?;
@@ -501,7 +593,23 @@ pub fn commit(prepared: &PreparedChange, keep_backup: bool) -> Result<String> {
         let _ = std::fs::remove_file(&candidate);
     })?;
     let backup_note = match backup {
-        Some(backup) => format!("Backup of the previous config: {}", backup.display()),
+        Some(backup) => {
+            let pruned = match prune_backups(config_file, &backup, policy.keep_newest) {
+                0 => String::new(),
+                1 => format!(
+                    " Removed 1 older backup, keeping the newest {}.",
+                    policy.keep_newest
+                ),
+                count => format!(
+                    " Removed {count} older backups, keeping the newest {}.",
+                    policy.keep_newest
+                ),
+            };
+            format!(
+                "Backup of the previous config: {}.{pruned}",
+                backup.display()
+            )
+        }
         None => "No backup was kept, as requested.".to_owned(),
     };
     Ok(format!(
@@ -552,7 +660,10 @@ pub fn prepare_remove_keybind(chord: &str) -> Result<PreparedChange> {
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_lines, included_files, plan_remove_keybind, plan_set_keybind, same_chord};
+    use super::{
+        backups_to_remove, changed_lines, included_files, next_backup_attempt, plan_remove_keybind,
+        plan_set_keybind, same_chord,
+    };
 
     const CONFIG: &str = r#"# My Umbriel config
 [general]
@@ -683,5 +794,88 @@ gap = 8
             "[include]\nfiles = [\"binds.toml\"]\n\n[include.optional]\nfiles = [\"local.toml\"]\n";
         assert_eq!(included_files(config), vec!["binds.toml", "local.toml"]);
         assert!(included_files(CONFIG).is_empty());
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_the_newest_backups_are_kept() {
+        let existing = names(&[
+            "config.toml.bak-1700000003",
+            "config.toml.bak-1700000001",
+            "config.toml.bak-1700000003-2",
+            "config.toml.bak-1700000002",
+            "config.toml",
+        ]);
+
+        let mut removed =
+            backups_to_remove(&existing, "config.toml", 2, "config.toml.bak-1700000003-2");
+        removed.sort();
+
+        assert_eq!(
+            removed,
+            ["config.toml.bak-1700000001", "config.toml.bak-1700000002"]
+        );
+    }
+
+    #[test]
+    fn files_umbriel_mcp_did_not_name_are_never_removed() {
+        let existing = names(&[
+            "config.toml.bak-1700000001",
+            "config.toml.bak-1700000002",
+            "config.toml.bak",
+            "config.toml.bak-old",
+            "config.toml.bak-1700000000-x",
+            "other.toml.bak-1600000000",
+            "notes.txt",
+        ]);
+
+        assert_eq!(
+            backups_to_remove(&existing, "config.toml", 1, "config.toml.bak-1700000002"),
+            ["config.toml.bak-1700000001"]
+        );
+    }
+
+    #[test]
+    fn nothing_is_removed_while_within_the_limit() {
+        let existing = names(&["config.toml.bak-1", "config.toml.bak-2"]);
+        assert!(backups_to_remove(&existing, "config.toml", 5, "config.toml.bak-2").is_empty());
+    }
+
+    #[test]
+    fn the_backup_just_written_is_never_removed() {
+        let existing = names(&[
+            "config.toml.bak-1700000000-3",
+            "config.toml.bak-1700000000-2",
+            "config.toml.bak-1700000000",
+        ]);
+
+        let removed = backups_to_remove(&existing, "config.toml", 2, "config.toml.bak-1700000000");
+
+        assert_eq!(removed, ["config.toml.bak-1700000000-2"]);
+    }
+
+    #[test]
+    fn a_new_backup_numbers_after_every_backup_from_the_same_second() {
+        let existing = names(&["config.toml.bak-1700000000-3", "config.toml.bak-1699999999"]);
+
+        assert_eq!(
+            next_backup_attempt(&existing, "config.toml", 1_700_000_000),
+            4
+        );
+        assert_eq!(
+            next_backup_attempt(&existing, "config.toml", 1_700_000_001),
+            1
+        );
+        assert_eq!(
+            next_backup_attempt(
+                &names(&["config.toml.bak-1700000000"]),
+                "config.toml",
+                1_700_000_000
+            ),
+            2
+        );
     }
 }

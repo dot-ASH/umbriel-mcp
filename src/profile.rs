@@ -79,6 +79,9 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("set_option", Access::Control),
     ("reset_option", Access::Control),
     ("apply_config_change", Access::Control),
+    ("add_rule", Access::Control),
+    ("replace_rule", Access::Control),
+    ("remove_rule", Access::Control),
     ("launch_app", Access::Execute),
 ];
 

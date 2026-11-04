@@ -187,8 +187,12 @@ updates in the background.
 - If it was installed by a package manager (pacman or makepkg, `cargo install`, Nix), it refuses
   and tells you the package manager's command instead, so the two never disagree.
 - Versions 0.2.2 and older have no `update` command; run the install script once to get it.
-- The checksum proves the download matches the GitHub release. It cannot protect against a
-  compromised GitHub account; releases are not yet signed.
+- Releases are signed. `update` and the install script accept a release only if its
+  `SHA256SUMS` carries a valid signature from the umbriel-mcp release key, whose public half is
+  built into the binary and the script, and only then trust its checksums. A tampered or unsigned
+  release is refused. Updates are protected even if the GitHub account were compromised; a first
+  install with the script is not, because the script itself comes from GitHub.
+- Releases 0.2.2 and older are unsigned, so the script and `update` only install 0.2.3 and newer.
 
 ## Requirements
 
@@ -294,7 +298,8 @@ The schema has no prose descriptions; explanations live in the
 `layout.gap` or `appearance.blur.enabled`, and `set_keybind` and `remove_keybind` change
 keybinds. Keys and values are checked against Umbriel's schema (type, range, allowed values),
 then the edited config is checked with `umbriel config validate`. Rule lists such as
-`window_rule` are not editable yet.
+`window_rule` are edited with `add_rule`, `replace_rule` and `remove_rule`, which take a
+rule as JSON and a position counted from 1 in the order `read_config` shows.
 
 **Every change needs your approval before anything is written:**
 
@@ -311,7 +316,9 @@ then the edited config is checked with `umbriel config validate`. Rule lists suc
 
 The same approval step asks whether to keep a backup of the previous config. If you say yes,
 or don't answer that question, it is saved next to the config as `config.toml.bak-<time>`; say
-no to avoid collecting backup files. Backups are never deleted automatically. When a change is
+no to avoid collecting backup files. umbriel-mcp keeps the newest 5
+of its own backups and deletes older ones whenever it writes a new one; start it with
+`--keep-backups N` to keep more (up to 1000). When a change is
 written, only the changed lines differ (comments and formatting are kept), a symlinked config
 stays a symlink, and Umbriel applies it immediately.
 

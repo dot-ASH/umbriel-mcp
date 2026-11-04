@@ -1,21 +1,12 @@
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
+use support::scratch_directory;
 
-static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 const ARCH: &str = std::env::consts::ARCH;
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
-
-fn scratch(purpose: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "umbriel-update-{purpose}-{}-{}",
-        std::process::id(),
-        SCRATCH_COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&directory).expect("create scratch directory");
-    directory
-}
 
 fn fake_binary(version: &str) -> String {
     format!(
@@ -25,14 +16,77 @@ fn fake_binary(version: &str) -> String {
 
 struct FakeRelease {
     root: PathBuf,
+    public_key: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Signing {
+    Correct,
+    Missing,
+    WrongKey,
+    SumsEditedAfterwards,
+}
+
+fn openssl(arguments: &[&std::ffi::OsStr]) {
+    let status = Command::new("openssl")
+        .args(arguments)
+        .status()
+        .expect("run openssl");
+    assert!(status.success(), "openssl {arguments:?} failed");
+}
+
+fn new_key_pair(folder: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let private = folder.join(format!("{name}-private.pem"));
+    let public = folder.join(format!("{name}-public.pem"));
+    openssl(&[
+        "genpkey".as_ref(),
+        "-algorithm".as_ref(),
+        "ed25519".as_ref(),
+        "-out".as_ref(),
+        private.as_os_str(),
+    ]);
+    openssl(&[
+        "pkey".as_ref(),
+        "-in".as_ref(),
+        private.as_os_str(),
+        "-pubout".as_ref(),
+        "-out".as_ref(),
+        public.as_os_str(),
+    ]);
+    (private, public)
+}
+
+fn sign(private: &Path, message: &Path, signature: &Path) {
+    openssl(&[
+        "pkeyutl".as_ref(),
+        "-sign".as_ref(),
+        "-inkey".as_ref(),
+        private.as_os_str(),
+        "-rawin".as_ref(),
+        "-in".as_ref(),
+        message.as_os_str(),
+        "-out".as_ref(),
+        signature.as_os_str(),
+    ]);
 }
 
 impl FakeRelease {
     fn publish(version: &str, binary_text: &str, tamper_checksum: bool) -> Self {
-        let root = scratch("release");
+        Self::publish_signed(version, binary_text, tamper_checksum, Signing::Correct)
+    }
+
+    fn publish_signed(
+        version: &str,
+        binary_text: &str,
+        tamper_checksum: bool,
+        signing: Signing,
+    ) -> Self {
+        let keys = scratch_directory("keys");
+        let (trusted_private, trusted_public) = new_key_pair(&keys, "trusted");
+        let root = scratch_directory("release");
         let tag = format!("v{version}");
         let folder = format!("umbriel-mcp-{tag}-{ARCH}-linux");
-        let staging = scratch("staging");
+        let staging = scratch_directory("staging");
         std::fs::create_dir_all(staging.join(&folder)).unwrap();
         let binary = staging.join(&folder).join("umbriel-mcp");
         std::fs::write(&binary, binary_text).unwrap();
@@ -60,8 +114,29 @@ impl FakeRelease {
         }
         let latest = root.join("latest").join("download");
         std::fs::create_dir_all(&latest).unwrap();
-        std::fs::write(latest.join("SHA256SUMS"), sums).unwrap();
-        Self { root }
+        std::fs::write(latest.join("SHA256SUMS"), &sums).unwrap();
+        let signature = latest.join("SHA256SUMS.sig");
+        match signing {
+            Signing::Missing => {}
+            Signing::Correct | Signing::SumsEditedAfterwards => {
+                sign(&trusted_private, &latest.join("SHA256SUMS"), &signature)
+            }
+            Signing::WrongKey => {
+                let (other_private, _) = new_key_pair(&keys, "other");
+                sign(&other_private, &latest.join("SHA256SUMS"), &signature);
+            }
+        }
+        if signing == Signing::SumsEditedAfterwards {
+            std::fs::write(
+                latest.join("SHA256SUMS"),
+                format!("{sums}{}  extra-file\n", "1".repeat(64)),
+            )
+            .unwrap();
+        }
+        Self {
+            root,
+            public_key: trusted_public,
+        }
     }
 
     fn url(&self) -> String {
@@ -76,14 +151,34 @@ fn installed_copy(folder: &Path) -> PathBuf {
     executable
 }
 
+struct WritableOnDrop(PathBuf);
+
+impl Drop for WritableOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 fn run_update(executable: &Path, release: &FakeRelease, arguments: &[&str], path: &str) -> Output {
-    Command::new(executable)
-        .arg("update")
-        .args(arguments)
-        .env("UMBRIEL_MCP_RELEASES", release.url())
-        .env("PATH", path)
-        .output()
-        .expect("run update")
+    for _ in 0..100 {
+        let attempt = Command::new(executable)
+            .arg("update")
+            .args(arguments)
+            .env("UMBRIEL_MCP_RELEASES", release.url())
+            .env("UMBRIEL_MCP_RELEASE_KEY", &release.public_key)
+            .env("PATH", path)
+            .output();
+        match attempt {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.expect("run update"),
+        }
+    }
+    panic!(
+        "{} stayed busy: another test thread kept it open for writing",
+        executable.display()
+    )
 }
 
 fn text(output: &Output) -> String {
@@ -101,7 +196,7 @@ fn is_original(executable: &Path) -> bool {
 #[test]
 fn a_newer_release_replaces_the_binary_in_place() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let executable = installed_copy(&scratch("home").join(".local/bin"));
+    let executable = installed_copy(&scratch_directory("home").join(".local/bin"));
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
@@ -126,7 +221,7 @@ fn a_newer_release_replaces_the_binary_in_place() {
 fn the_current_version_is_left_alone() {
     let version = env!("CARGO_PKG_VERSION");
     let release = FakeRelease::publish(version, &fake_binary(version), false);
-    let executable = installed_copy(&scratch("same"));
+    let executable = installed_copy(&scratch_directory("same"));
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
@@ -138,7 +233,7 @@ fn the_current_version_is_left_alone() {
 #[test]
 fn check_only_reports_without_changing_anything() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let executable = installed_copy(&scratch("check"));
+    let executable = installed_copy(&scratch_directory("check"));
 
     let output = run_update(&executable, &release, &["--check"], SYSTEM_PATH);
 
@@ -154,7 +249,7 @@ fn check_only_reports_without_changing_anything() {
 #[test]
 fn a_download_that_does_not_match_its_checksum_is_refused() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), true);
-    let executable = installed_copy(&scratch("tampered"));
+    let executable = installed_copy(&scratch_directory("tampered"));
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
@@ -170,7 +265,7 @@ fn a_download_that_does_not_match_its_checksum_is_refused() {
 #[test]
 fn a_binary_that_reports_the_wrong_version_is_refused() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("1.2.3"), false);
-    let executable = installed_copy(&scratch("wrong-version"));
+    let executable = installed_copy(&scratch_directory("wrong-version"));
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
@@ -186,13 +281,13 @@ fn a_binary_that_reports_the_wrong_version_is_refused() {
 #[test]
 fn an_unwritable_install_folder_asks_for_sudo() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let folder = scratch("locked");
+    let folder = scratch_directory("locked");
     let executable = installed_copy(&folder);
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _writable_again = WritableOnDrop(folder.clone());
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!output.status.success());
     assert!(
         text(&output).contains("sudo umbriel-mcp update"),
@@ -205,7 +300,7 @@ fn an_unwritable_install_folder_asks_for_sudo() {
 #[test]
 fn a_cargo_installation_is_pointed_at_cargo() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let executable = installed_copy(&scratch("cargo").join(".cargo/bin"));
+    let executable = installed_copy(&scratch_directory("cargo").join(".cargo/bin"));
 
     let output = run_update(&executable, &release, &[], SYSTEM_PATH);
 
@@ -221,13 +316,13 @@ fn a_cargo_installation_is_pointed_at_cargo() {
 #[test]
 fn without_curl_the_update_explains_what_is_missing() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let executable = installed_copy(&scratch("no-curl"));
+    let executable = installed_copy(&scratch_directory("no-curl"));
 
     let output = run_update(
         &executable,
         &release,
         &[],
-        scratch("empty-path").to_str().unwrap(),
+        scratch_directory("empty-path").to_str().unwrap(),
     );
 
     assert!(!output.status.success());
@@ -246,6 +341,7 @@ fn run_installer(release: &FakeRelease, home: &Path, extra_path: Option<&Path>) 
     Command::new("sh")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
         .env("UMBRIEL_MCP_RELEASES", release.url())
+        .env("UMBRIEL_MCP_RELEASE_KEY", &release.public_key)
         .env("HOME", home)
         .env_remove("UMBRIEL_MCP_INSTALL_DIR")
         .env("PATH", path)
@@ -256,7 +352,7 @@ fn run_installer(release: &FakeRelease, home: &Path, extra_path: Option<&Path>) 
 #[test]
 fn the_installer_puts_the_verified_binary_in_local_bin_and_runs_doctor() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let home = scratch("installer-home");
+    let home = scratch_directory("installer-home");
 
     let output = run_installer(&release, &home, None);
 
@@ -275,7 +371,7 @@ fn the_installer_puts_the_verified_binary_in_local_bin_and_runs_doctor() {
 #[test]
 fn the_installer_refuses_a_tampered_download() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), true);
-    let home = scratch("installer-tampered");
+    let home = scratch_directory("installer-tampered");
 
     let output = run_installer(&release, &home, None);
 
@@ -291,8 +387,8 @@ fn the_installer_refuses_a_tampered_download() {
 #[test]
 fn the_installer_warns_about_an_older_copy_earlier_on_the_path() {
     let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
-    let home = scratch("installer-shadowed");
-    let old_location = scratch("usr-local-bin");
+    let home = scratch_directory("installer-shadowed");
+    let old_location = scratch_directory("usr-local-bin");
     std::fs::write(old_location.join("umbriel-mcp"), fake_binary("0.1.0")).unwrap();
     std::fs::set_permissions(
         old_location.join("umbriel-mcp"),
@@ -312,4 +408,48 @@ fn the_installer_warns_about_an_older_copy_earlier_on_the_path() {
         )),
         "{report}"
     );
+}
+
+fn assert_update_refused(signing: Signing, expected: &str) {
+    let release = FakeRelease::publish_signed("99.0.0", &fake_binary("99.0.0"), false, signing);
+    let executable = installed_copy(&scratch_directory("signing"));
+
+    let output = run_update(&executable, &release, &[], SYSTEM_PATH);
+
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains(expected), "{}", text(&output));
+    assert!(is_original(&executable));
+}
+
+#[test]
+fn an_unsigned_release_is_not_installed_by_update() {
+    assert_update_refused(Signing::Missing, "is not signed");
+}
+
+#[test]
+fn a_release_signed_with_another_key_is_not_installed_by_update() {
+    assert_update_refused(Signing::WrongKey, "signature does not match");
+}
+
+#[test]
+fn a_checksum_list_changed_after_signing_is_not_installed_by_update() {
+    assert_update_refused(Signing::SumsEditedAfterwards, "signature does not match");
+}
+
+fn assert_installer_refused(signing: Signing, expected: &str) {
+    let release = FakeRelease::publish_signed("99.0.0", &fake_binary("99.0.0"), false, signing);
+    let home = scratch_directory("installer-signing");
+
+    let output = run_installer(&release, &home, None);
+
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains(expected), "{}", text(&output));
+    assert!(!home.join(".local/bin/umbriel-mcp").exists());
+}
+
+#[test]
+fn the_installer_refuses_unsigned_and_wrongly_signed_releases() {
+    assert_installer_refused(Signing::Missing, "is not signed");
+    assert_installer_refused(Signing::WrongKey, "signature does not match");
+    assert_installer_refused(Signing::SumsEditedAfterwards, "signature does not match");
 }

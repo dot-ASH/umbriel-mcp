@@ -1,19 +1,9 @@
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn scratch_directory(purpose: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "umbriel-install-{purpose}-{}-{}",
-        std::process::id(),
-        SCRATCH_COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&directory).expect("create scratch directory");
-    directory
-}
+use support::scratch_directory;
 
 fn install_recording_program(directory: &Path, name: &str, exit_code: i32) -> PathBuf {
     let record = directory.join(format!("{name}.args"));

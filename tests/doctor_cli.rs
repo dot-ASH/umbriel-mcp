@@ -1,21 +1,11 @@
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static SCRATCH_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn scratch_directory(purpose: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "umbriel-doctor-{purpose}-{}-{}",
-        std::process::id(),
-        SCRATCH_COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&directory).expect("create scratch directory");
-    directory
-}
+use support::scratch_directory;
 
 fn install_fake_program(directory: &Path, name: &str, script_body: &str) {
     let path = directory.join(name);

@@ -3,6 +3,8 @@ use serde_json::Value;
 const README: &str = include_str!("../README.md");
 const SERVER_MANIFEST: &str = include_str!("../server.json");
 const AUR_RECIPE: &str = include_str!("../packaging/aur-bin/PKGBUILD");
+const INSTALLER: &str = include_str!("../install.sh");
+const RELEASE_KEY: &str = include_str!("../release-signing-key.pem");
 
 fn manifest() -> Value {
     serde_json::from_str(SERVER_MANIFEST).expect("server.json is JSON")
@@ -44,4 +46,12 @@ fn every_published_version_matches_the_crate_version() {
     assert_eq!(manifest["packages"][0]["version"], version);
     assert!(AUR_RECIPE.contains(&format!("pkgver={version}\n")));
     assert!(README.contains(&format!("tag=v{version}\n")));
+}
+
+#[test]
+fn the_installer_trusts_the_same_release_key_as_the_binary() {
+    assert!(
+        INSTALLER.contains(RELEASE_KEY.trim()),
+        "install.sh must embed release-signing-key.pem exactly"
+    );
 }

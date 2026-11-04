@@ -1,13 +1,15 @@
+mod support;
+
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use support::McpProcess;
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
@@ -194,91 +196,12 @@ ignore_dispatch!(
     ZwlrLayerShellV1
 );
 
-struct McpProcess {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    next_id: u64,
-}
-
-impl McpProcess {
-    fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start MCP server");
-        let input = child.stdin.take().expect("MCP stdin");
-        let output = BufReader::new(child.stdout.take().expect("MCP stdout"));
-        let mut process = Self {
-            child,
-            input,
-            output,
-            next_id: 1,
-        };
-        let initialized = process.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": { "name": "wayland-pointer-smoke", "version": "1" }
-            }),
-        );
-        assert_eq!(initialized["result"]["serverInfo"]["name"], "umbriel-mcp");
-        process.notify("notifications/initialized", json!({}));
-        process
-    }
-
-    fn notify(&mut self, method: &str, params: Value) {
-        writeln!(
-            self.input,
-            "{}",
-            json!({"jsonrpc":"2.0", "method":method, "params":params})
-        )
-        .expect("write MCP notification");
-        self.input.flush().expect("flush MCP notification");
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        writeln!(
-            self.input,
-            "{}",
-            json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
-        )
-        .expect("write MCP request");
-        self.input.flush().expect("flush MCP request");
-        loop {
-            let mut line = String::new();
-            self.output.read_line(&mut line).expect("read MCP response");
-            assert!(!line.is_empty(), "MCP server stopped unexpectedly");
-            let response: Value = serde_json::from_str(&line).expect("MCP JSON response");
-            if response["id"].as_u64() == Some(id) {
-                return response;
-            }
-        }
-    }
-
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.request("tools/call", json!({"name":name, "arguments":arguments}))
-    }
-
-    fn move_pointer(&mut self, x: i32, y: i32) {
-        let response = self.call_tool("mouse_move", json!({"x":x,"y":y}));
-        assert!(
-            response.get("result").is_some(),
-            "mouse_move failed: {response}"
-        );
-    }
-}
-
-impl Drop for McpProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn move_pointer(mcp: &mut McpProcess, x: i32, y: i32) {
+    let response = mcp.call_tool("mouse_move", json!({"x":x,"y":y}));
+    assert!(
+        response.get("result").is_some(),
+        "mouse_move failed: {response}"
+    );
 }
 
 #[derive(Debug)]
@@ -470,14 +393,14 @@ fn mcp_pointer_motion_is_exact_across_the_global_desktop_layout() {
     );
 
     let (connection, mut queue, mut state) = create_pointer_probe(&placements);
-    let mut mcp = McpProcess::start();
+    let mut mcp = McpProcess::start_live();
     for output in &placements {
         let target = (
             output.x + output.width as i32 / 2,
             output.y + output.height as i32 / 2,
         );
         state.last_global_position.lock().unwrap().take();
-        mcp.move_pointer(target.0, target.1);
+        move_pointer(&mut mcp, target.0, target.1);
         let observed = wait_for_position(&connection, &mut queue, &mut state, target);
         assert_eq!(
             observed, target,
@@ -585,7 +508,7 @@ fn capture_terminal_output(title: &str, interact: impl FnOnce(&mut McpProcess)) 
         std::process::id()
     ));
     let command = format!("kitty --title={title} -e sh -c 'cat > {}'", path.display());
-    let mut mcp = McpProcess::start();
+    let mut mcp = McpProcess::start_live();
     let launched = mcp.call_tool("launch_app", json!({"command":command}));
     assert!(
         launched.get("result").is_some(),
@@ -701,7 +624,7 @@ fn mcp_virtual_keyboard_types_multiline_text_and_tabs() {
 #[test]
 #[ignore = "requires a running Umbriel session and kitty"]
 fn mcp_virtual_keyboard_rejects_uncomposable_input_before_typing_anything() {
-    let mut mcp = McpProcess::start();
+    let mut mcp = McpProcess::start_live();
     let bad_text = mcp.call_tool("type_text", json!({"text":"fine\u{7}bell"}));
     assert!(
         bad_text["error"]["message"]

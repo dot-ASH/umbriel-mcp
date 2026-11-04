@@ -2,7 +2,7 @@ use crate::capture_target::{
     CaptureTarget, Choice, DEFAULT_RECORDING_SECONDS, Purpose, RECORDING_LENGTHS, human_duration,
     parse_choice,
 };
-use crate::config_edit::{PreparedChange, commit};
+use crate::config_edit::{BackupPolicy, PreparedChange, commit};
 use anyhow::{Result, anyhow};
 use rmcp::model::{ElicitRequestParams, ElicitationAction, ElicitationSchema, EnumSchema};
 use rmcp::service::{ElicitationError, ElicitationMode, ServiceError};
@@ -99,6 +99,7 @@ pub async fn ask_then_commit(
     peer: &Peer<RoleServer>,
     pending: &PendingChanges,
     change: PreparedChange,
+    keep_newest: usize,
 ) -> Result<String> {
     if !peer
         .supported_elicitation_modes()
@@ -120,7 +121,13 @@ pub async fn ask_then_commit(
         Ok(Some(WriteApproval {
             apply: true,
             backup,
-        })) => commit(&change, backup),
+        })) => commit(
+            &change,
+            BackupPolicy {
+                keep_backup: backup,
+                keep_newest,
+            },
+        ),
         Ok(_)
         | Err(ElicitationError::UserDeclined)
         | Err(ElicitationError::UserCancelled)
