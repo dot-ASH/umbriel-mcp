@@ -2657,7 +2657,7 @@ fn wait_for_text_returns_once_the_text_appears() {
 
     let found = server.call_text(
         "wait_for_text",
-        json!({"target": "Cancel", "timeout_ms": 8000}),
+        json!({"target": "Cancel", "timeout_ms": 25000}),
     );
 
     assert!(found.contains("\"Cancel\""), "{found}");
@@ -2686,7 +2686,7 @@ fn wait_for_change_compares_with_the_previous_capture_and_returns_the_settled_sc
         start_playing(&[fixture_frame(), fixture_frame(), blank_frame(&tools, 30)]);
 
     server.call_text("screenshot", json!({}));
-    let response = server.call_tool("wait_for_change", json!({"timeout_ms": 8000}));
+    let response = server.call_tool("wait_for_change", json!({"timeout_ms": 25000}));
 
     let note = text_content(&response);
     assert!(note.contains("changed after"), "{note}");

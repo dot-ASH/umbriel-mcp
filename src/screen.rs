@@ -89,9 +89,7 @@ impl Fingerprint {
             / image.width().max(1) as f64)
             .round()
             .max(1.0) as u32;
-        let small = image
-            .resize_exact(FINGERPRINT_WIDTH, height, FilterType::Triangle)
-            .to_luma8();
+        let small = image.thumbnail_exact(FINGERPRINT_WIDTH, height).to_luma8();
         Self {
             width: small.width(),
             height: small.height(),
@@ -126,7 +124,7 @@ pub fn clock_time(moment: SystemTime) -> String {
 }
 
 pub struct Capture {
-    pub jpeg: Vec<u8>,
+    decoded: DynamicImage,
     pub native_png: Vec<u8>,
     pub native_width: u32,
     pub native_height: u32,
@@ -146,26 +144,21 @@ impl Capture {
         let native_width = decoded.width();
         let native_height = decoded.height();
         let fingerprint = Fingerprint::of(&decoded);
-
-        let scaled = if native_width > max_width && max_width > 0 {
+        let (encoded_width, encoded_height) = if native_width > max_width && max_width > 0 {
             let height =
                 (native_height as f64 * max_width as f64 / native_width as f64).round() as u32;
-            decoded.resize(max_width, height.max(1), FilterType::Lanczos3)
+            (max_width, height.max(1))
         } else {
-            decoded
+            (native_width, native_height)
         };
 
-        let mut jpeg = Vec::new();
-        JpegEncoder::new_with_quality(&mut Cursor::new(&mut jpeg), JPEG_QUALITY)
-            .encode_image(&scaled)?;
-
         Ok(Self {
-            jpeg,
+            decoded,
             native_png: png.to_vec(),
             native_width,
             native_height,
-            encoded_width: scaled.width(),
-            encoded_height: scaled.height(),
+            encoded_width,
+            encoded_height,
             origin_x: origin.0,
             origin_y: origin.1,
             shown_on_screen: true,
@@ -173,6 +166,24 @@ impl Capture {
             window_title: None,
             fingerprint,
         })
+    }
+
+    pub fn jpeg(&self) -> Result<Vec<u8>> {
+        let scaled = if (self.encoded_width, self.encoded_height)
+            == (self.native_width, self.native_height)
+        {
+            self.decoded.clone()
+        } else {
+            self.decoded.resize_exact(
+                self.encoded_width,
+                self.encoded_height,
+                FilterType::Lanczos3,
+            )
+        };
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut Cursor::new(&mut jpeg), JPEG_QUALITY)
+            .encode_image(&scaled)?;
+        Ok(jpeg)
     }
 
     pub fn coordinate_note(&self) -> String {
@@ -685,7 +696,7 @@ mod tests {
         assert_eq!((capture.origin_x, capture.origin_y), (1920, 0));
         let native = image::load_from_memory(&capture.native_png).unwrap();
         assert_eq!((native.width(), native.height()), (3840, 1080));
-        let preview = image::load_from_memory(&capture.jpeg).unwrap();
+        let preview = image::load_from_memory(&capture.jpeg().unwrap()).unwrap();
         assert_eq!(preview.width(), 1024);
     }
 

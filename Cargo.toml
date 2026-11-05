@@ -36,3 +36,6 @@ ed25519-compact = { version = "2.6.0", default-features = false, features = ["st
 strip = true
 lto = true
 codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2

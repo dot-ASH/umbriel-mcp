@@ -1119,7 +1119,10 @@ impl UmbrielServer {
         let max_width = request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH);
         let (shot, notes) = self.watcher.capture(&area, max_width).map_err(failed)?;
         Ok(CallToolResult::success(vec![
-            ContentBlock::image(BASE64_STANDARD.encode(&shot.jpeg), "image/jpeg"),
+            ContentBlock::image(
+                BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
+                "image/jpeg",
+            ),
             ContentBlock::text(capture_description(&shot, &notes)),
         ]))
     }
@@ -1140,7 +1143,10 @@ impl UmbrielServer {
         let (shot, notes) = self.watcher.capture(&area, max_width).map_err(failed)?;
         let recognised = screen::read_text(&shot.native_png).map_err(failed)?;
         Ok(CallToolResult::success(vec![
-            ContentBlock::image(BASE64_STANDARD.encode(&shot.jpeg), "image/jpeg"),
+            ContentBlock::image(
+                BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
+                "image/jpeg",
+            ),
             ContentBlock::text(format!(
                 "{}\n\nOCR text:\n{recognised}",
                 capture_description(&shot, &notes)
@@ -1333,7 +1339,10 @@ impl UmbrielServer {
             }
         };
         Ok(CallToolResult::success(vec![
-            ContentBlock::image(BASE64_STANDARD.encode(&shot.jpeg), "image/jpeg"),
+            ContentBlock::image(
+                BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
+                "image/jpeg",
+            ),
             ContentBlock::text(format!("{summary}\n{}", capture_description(&shot, &notes))),
         ]))
     }
