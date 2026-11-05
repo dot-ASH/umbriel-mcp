@@ -70,7 +70,7 @@ fn spawn_tied_to_this_server(command: Command) -> std::io::Result<Child> {
         .map_err(|_| std::io::Error::other("the recorder spawning thread did not answer"))?
 }
 
-fn recordings_folder() -> Result<PathBuf> {
+pub fn recordings_location() -> Result<PathBuf> {
     let home =
         std::env::var("HOME").context("HOME is not set, so recordings have nowhere to go")?;
     let config_home = std::env::var("XDG_CONFIG_HOME")
@@ -79,7 +79,11 @@ fn recordings_folder() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&home).join(".config"));
     let user_dirs = std::fs::read_to_string(config_home.join("user-dirs.dirs")).ok();
-    let folder = videos_directory(user_dirs.as_deref(), &home);
+    Ok(videos_directory(user_dirs.as_deref(), &home))
+}
+
+fn recordings_folder() -> Result<PathBuf> {
+    let folder = recordings_location()?;
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("cannot create {}", folder.display()))?;
     Ok(folder)

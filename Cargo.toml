@@ -31,6 +31,7 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 toml_edit = "0.25.17"
 sha2 = "0.11.1"
 ed25519-compact = { version = "2.6.0", default-features = false, features = ["std", "pem"] }
+jsonc-parser = { version = "0.34", features = ["cst"] }
 
 [profile.release]
 strip = true

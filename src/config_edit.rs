@@ -191,7 +191,7 @@ pub fn remove_keeping_comments_above(table: &mut dyn TableLike, key: &str) -> Op
     removed
 }
 
-fn backup_order(name: &str, config_name: &str) -> Option<(u64, u64)> {
+pub fn backup_order(name: &str, config_name: &str) -> Option<(u64, u64)> {
     let stamp = name.strip_prefix(config_name)?.strip_prefix(".bak-")?;
     let digits = |text: &str| {
         (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))

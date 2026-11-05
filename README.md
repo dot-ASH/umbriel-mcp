@@ -195,6 +195,26 @@ updates in the background.
   install with the script is not, because the script itself comes from GitHub.
 - Releases 0.2.3 and older are unsigned, so the script and `update` only install 0.3.0 and newer.
 
+## Uninstalling
+
+```sh
+umbriel-mcp uninstall
+```
+
+This lists what it will remove and asks once (`--yes` skips the question):
+
+- the `umbriel` server registered with pi, Claude Code, opencode, Cursor, VS Code or Zed.
+  Claude Code is unregistered through its own CLI; in the others' config files only the
+  `umbriel` entry is deleted, and comments, formatting and other servers stay as they were. An
+  entry named `umbriel` that runs some other program is left alone.
+- the `umbriel-mcp` program itself, when the install script or `umbriel-mcp update` put it
+  there. If you run it through a symlink, only the link is removed. For a pacman, cargo or Nix
+  install it prints the command to run instead.
+
+`--keep-binary` only unregisters. Config backups and screen recordings are listed but kept.
+Restart any running harness afterwards. Registrations inside a single project (a project's
+`opencode.json` or `.cursor/mcp.json`) are not searched; delete those entries by hand.
+
 ## Requirements
 
 Pointer, keyboard, and clipboard need nothing beyond a running Umbriel session. These

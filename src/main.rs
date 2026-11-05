@@ -13,6 +13,7 @@ mod register;
 mod rules;
 mod screen;
 mod setting;
+mod uninstall;
 mod update;
 mod watching;
 
@@ -1679,6 +1680,15 @@ enum Command {
         #[arg(long, value_enum)]
         profile: Option<Profile>,
     },
+    /// Unregister umbriel-mcp from every harness and remove this binary
+    Uninstall {
+        /// Do not ask before removing
+        #[arg(long)]
+        yes: bool,
+        /// Only unregister; leave the umbriel-mcp binary installed
+        #[arg(long)]
+        keep_binary: bool,
+    },
 }
 
 #[tokio::main]
@@ -1688,6 +1698,9 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
         Some(Command::Doctor) => return Ok(doctor::run()),
         Some(Command::Update { check }) => return Ok(update::run(check)),
         Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
+        Some(Command::Uninstall { yes, keep_binary }) => {
+            return Ok(uninstall::run(yes, keep_binary));
+        }
         None => {}
     }
     let service = UmbrielServer::new(cli.profile, cli.keep_backups)

@@ -64,24 +64,42 @@ pub fn digest_for(sums: &str, file: &str) -> Option<String> {
     })
 }
 
-pub fn classify(executable: &Path) -> Installation {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageManager {
+    System,
+    Cargo,
+    Nix,
+}
+
+pub fn package_manager_of(executable: &Path) -> Option<PackageManager> {
     let path = executable.to_string_lossy();
     if path.starts_with("/usr/bin/") || path.starts_with("/bin/") || path.starts_with("/usr/sbin/")
     {
-        return Installation::ManagedElsewhere(
-            "it was installed by your system package manager, so update it there (for the AUR \
-             package: `yay -Syu umbriel-mcp-bin`; for a makepkg build: rebuild the recipe)",
-        );
+        return Some(PackageManager::System);
     }
     if path.contains("/.cargo/bin/") {
-        return Installation::ManagedElsewhere(
-            "it was installed with cargo, so update it with `cargo install umbriel-mcp --locked`",
-        );
+        return Some(PackageManager::Cargo);
     }
     if path.starts_with("/nix/") {
-        return Installation::ManagedElsewhere("it was installed with Nix, so update it there");
+        return Some(PackageManager::Nix);
     }
-    Installation::SelfManaged
+    None
+}
+
+pub fn classify(executable: &Path) -> Installation {
+    match package_manager_of(executable) {
+        Some(PackageManager::System) => Installation::ManagedElsewhere(
+            "it was installed by your system package manager, so update it there (for the AUR \
+             package: `yay -Syu umbriel-mcp-bin`; for a makepkg build: rebuild the recipe)",
+        ),
+        Some(PackageManager::Cargo) => Installation::ManagedElsewhere(
+            "it was installed with cargo, so update it with `cargo install umbriel-mcp --locked`",
+        ),
+        Some(PackageManager::Nix) => {
+            Installation::ManagedElsewhere("it was installed with Nix, so update it there")
+        }
+        None => Installation::SelfManaged,
+    }
 }
 
 pub fn verify_release_signature(public_key_pem: &str, sums: &[u8], signature: &[u8]) -> Result<()> {
