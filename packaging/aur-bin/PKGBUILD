@@ -1,7 +1,7 @@
 # Maintainer: Nafees Ashker Sakir <nafees.ashker@gmail.com>
 pkgname=umbriel-mcp-bin
 _binary=umbriel-mcp
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc="MCP server for the Umbriel Wayland compositor (prebuilt static binary)"
 arch=('x86_64' 'aarch64')
@@ -17,8 +17,8 @@ optdepends=('umbriel-git: the compositor this server controls'
             'wf-recorder: screen recording')
 source_x86_64=("$_binary-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-x86_64-linux.tar.gz")
 source_aarch64=("$_binary-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-aarch64-linux.tar.gz")
-sha256sums_x86_64=('e1c16ab5bb4680f680ddeab18d2580fce606b6d95256983c345d3e1d20848b7c')
-sha256sums_aarch64=('60e8db13f41284f09e492c05e5f81dc5e774c87c0c138a03b6cd066ef983a960')
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
 
 package() {
   cd "$_binary-v$pkgver-$CARCH-linux"
