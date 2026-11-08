@@ -454,9 +454,21 @@ pub struct PreparedChange {
     pub summary: String,
     pub change: String,
     pub caution: Option<String>,
+    always_ask_because: Option<String>,
 }
 
 impl PreparedChange {
+    pub fn asking_every_time_because(mut self, reason: Option<&str>) -> Self {
+        self.always_ask_because = reason.map(str::to_owned);
+        self
+    }
+
+    pub fn reason_to_ask_anyway(&self) -> Option<&str> {
+        self.caution
+            .as_deref()
+            .or(self.always_ask_because.as_deref())
+    }
+
     pub fn preview(&self) -> String {
         let caution = self
             .caution
@@ -534,6 +546,7 @@ pub fn prepare(
         summary,
         change,
         caution,
+        always_ask_because: None,
     }))
 }
 

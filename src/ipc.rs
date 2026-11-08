@@ -49,8 +49,131 @@ pub fn query(command: &str) -> Result<Value> {
     request(json!({ "cmd": command }))
 }
 
-pub fn dispatch(action: &str) -> Result<Value> {
-    request(json!({ "cmd": "msg", "arg": action }))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    TypedActions,
+    NameColonArgument,
+}
+
+static DETECTED_PROTOCOL: std::sync::Mutex<Option<Protocol>> = std::sync::Mutex::new(None);
+
+fn is_unknown_command(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("unknown command")
+}
+
+pub fn detect_protocol() -> Result<Protocol> {
+    match request(json!({ "cmd": "action" })) {
+        Err(error) if is_unknown_command(&error) => Ok(Protocol::NameColonArgument),
+        Err(error) if format!("{error:#}").contains("umbriel rejected") => {
+            Ok(Protocol::TypedActions)
+        }
+        Err(error) => Err(error),
+        Ok(_) => Ok(Protocol::TypedActions),
+    }
+}
+
+fn protocol() -> Result<Protocol> {
+    let mut detected = DETECTED_PROTOCOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(protocol) = *detected {
+        return Ok(protocol);
+    }
+    let protocol = detect_protocol()?;
+    *detected = Some(protocol);
+    Ok(protocol)
+}
+
+fn forget_protocol() {
+    *DETECTED_PROTOCOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn umbriel_version() -> String {
+    std::process::Command::new("umbriel")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "version unknown".to_owned())
+}
+
+fn protocol_mismatch(error: anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "{error:#}. This Umbriel ({}) does not accept the action request umbriel-mcp {} sent, \
+         so its IPC protocol has changed. Run `umbriel-mcp update`; if the newest umbriel-mcp \
+         still fails, report it at https://github.com/dot-ASH/umbriel-mcp/issues.",
+        umbriel_version(),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn with_protocol(send: impl Fn(Protocol) -> Result<()>) -> Result<()> {
+    match send(protocol()?) {
+        Err(error) if is_unknown_command(&error) => {
+            forget_protocol();
+            send(protocol()?).map_err(|error| {
+                if is_unknown_command(&error) {
+                    protocol_mismatch(error)
+                } else {
+                    error
+                }
+            })
+        }
+        other => other,
+    }
+}
+
+pub fn perform(action: &crate::actions::CompositorAction) -> Result<()> {
+    with_protocol(|protocol| {
+        match protocol {
+            Protocol::TypedActions => request(action.typed_request()),
+            Protocol::NameColonArgument => {
+                request(json!({ "cmd": "msg", "arg": action.legacy_text() }))
+            }
+        }
+        .map(|_| ())
+    })
+}
+
+fn run_through_umbriel_command(words: &[String]) -> Result<()> {
+    let output = std::process::Command::new("umbriel")
+        .arg("msg")
+        .args(words)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|cause| {
+            anyhow!("cannot run the umbriel command ({cause}); is Umbriel installed and on PATH?")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&[output.stdout, output.stderr].concat())
+        .trim()
+        .to_owned();
+    Err(anyhow!("umbriel rejected the request: {detail}"))
+}
+
+pub fn perform_text(action: &str) -> Result<()> {
+    with_protocol(|protocol| match protocol {
+        Protocol::TypedActions => {
+            run_through_umbriel_command(&crate::actions::words_for_command_line(action)?)
+        }
+        Protocol::NameColonArgument => request(json!({
+            "cmd": "msg",
+            "arg": crate::actions::legacy_text_for(action)?
+        }))
+        .map(|_| ()),
+    })
+}
+
+pub fn focused_window() -> Result<Value> {
+    match query("focused-window") {
+        Err(error) if format!("{error:#}").contains("no focused window") => Ok(Value::Null),
+        other => other,
+    }
 }
 
 pub fn windows() -> Result<Vec<Value>> {
@@ -62,14 +185,34 @@ pub struct WindowPlacement {
     pub origin: (i64, i64),
     pub size: (i64, i64),
     pub shown_on_screen: bool,
+    pub on_screen: crate::placement::OnScreen,
+    pub output_area: Option<crate::placement::Rect>,
+    pub drawn_over: Vec<crate::placement::Covering>,
     pub title: Option<String>,
 }
 
+pub fn listed(command: &str) -> Vec<Value> {
+    query(command)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
 pub fn window_placement(window_id: &str) -> Result<WindowPlacement> {
-    let matching = windows()?
-        .into_iter()
+    let all_windows = windows()?;
+    let matching = all_windows
+        .iter()
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(window_id))
+        .cloned()
         .ok_or_else(|| anyhow!("no window with id {window_id}"))?;
+    let outputs = listed("outputs");
+    let on_screen = crate::placement::on_screen(&matching, &outputs);
+    let output_area = matching
+        .get("output")
+        .and_then(Value::as_str)
+        .and_then(|name| crate::placement::output_rect(&outputs, name));
+    let drawn_over =
+        crate::placement::things_drawn_over(&matching, &all_windows, &listed("layers"));
 
     let number = |key: &str| -> Result<i64> {
         matching
@@ -83,10 +226,10 @@ pub fn window_placement(window_id: &str) -> Result<WindowPlacement> {
         geometry: format!("{x},{y} {width}x{height}"),
         origin: (x, y),
         size: (width, height),
-        shown_on_screen: matching
-            .get("visible")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+        shown_on_screen: on_screen.any_part_shown(),
+        on_screen,
+        output_area,
+        drawn_over,
         title: matching
             .get("title")
             .and_then(Value::as_str)

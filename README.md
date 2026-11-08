@@ -40,6 +40,13 @@ helpers.
 
 Older Ubuntu releases are not supported because Umbriel is not packaged for them.
 
+Umbriel builds from late October 2026 on changed how actions are sent: they take separate
+words (`workspace-switch 2 --output DP-1`) instead of `name:argument`
+(`workspace-switch:2/DP-1`). umbriel-mcp 0.4.2 and newer detect which form the running Umbriel
+uses and work with both, including when Umbriel is upgraded while a session runs; older
+umbriel-mcp versions fail on newer Umbriel with `unknown command: msg`. `umbriel-mcp doctor`
+shows which form your Umbriel uses.
+
 **Warning for Arch users:** the AUR package named `umbriel` is a placeholder and is not
 the compositor. Do not install it; the compositor is `umbriel-git`.
 
@@ -105,7 +112,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.4.1
+   tag=v0.4.2
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -346,6 +353,14 @@ rule as JSON and a position counted from 1 in the order `read_config` shows.
 - A code expires after 10 minutes, works once, and is refused if the file changed since the
   preview.
 
+**Making several changes in a row** — the approval also offers to stop asking for the rest of
+the session: a checkbox in the dialog, or, in clients without one, telling the model you don't
+want to be asked again. Later changes in that session are then applied straight away with the
+backup choice you made, and each result says it was applied without asking and shows the
+change. The permission ends with the session: a new harness session asks again. Changes that
+start programs or weaken a security check (`spawn:` keybinds, `general.autostart`, security
+context rules and the like) and changes that come with a caution still ask every time.
+
 The same approval step asks whether to keep a backup of the previous config. If you say yes,
 or don't answer that question, it is saved next to the config as `config.toml.bak-<time>`; say
 no to avoid collecting backup files. umbriel-mcp keeps the newest 5
@@ -395,7 +410,8 @@ waits for you.
 letter (`ctrl+A`) implies Shift. `type_text` accepts any Unicode text, with `\n` typed as Return
 and `\t` as Tab.
 
-`run_action` accepts any action from `umbriel msg --help`, so the compositor's full verb
+`run_action` accepts any action `list_actions` shows, written either way
+(`workspace-switch 2 --output DP-1` or `workspace-switch:2/DP-1`), so the compositor's full verb
 set stays reachable even where there is no dedicated tool.
 
 ## Notes

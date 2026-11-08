@@ -22,6 +22,10 @@ pub struct WriteApproval {
     /// Keep a backup of the previous config next to it (backups accumulate in the config folder)
     #[serde(default = "keep_backup_unless_told_otherwise")]
     pub backup: bool,
+    /// Also apply further config changes in this session without asking (changes with a caution,
+    /// or that start programs, still ask)
+    #[serde(default)]
+    pub allow_rest_of_session: bool,
 }
 
 pub fn keep_backup_unless_told_otherwise() -> bool {
@@ -34,9 +38,24 @@ rmcp::elicit_safe!(WriteApproval);
 pub struct PendingChanges {
     held: Mutex<HashMap<String, (PreparedChange, Instant)>>,
     issued: AtomicU64,
+    session_backup_choice: Mutex<Option<bool>>,
 }
 
 impl PendingChanges {
+    pub fn allow_rest_of_session(&self, keep_backup: bool) {
+        *self
+            .session_backup_choice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keep_backup);
+    }
+
+    fn session_backup_choice(&self) -> Option<bool> {
+        *self
+            .session_backup_choice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn new_code(&self) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -89,8 +108,10 @@ fn hold_for_confirmation(pending: &PendingChanges, change: PreparedChange) -> St
          show them exactly this change, ask whether to apply it and whether they want a backup of \
          the previous config kept (backups accumulate next to the config), and wait for an \
          explicit answer.\n\n{preview}\n\nOnly after the user approves, call \
-         apply_config_change with confirmation \"{code}\" and backup set to their answer. The \
-         code works once and expires in {} minutes. If they decline, do nothing.",
+         apply_config_change with confirmation \"{code}\" and backup set to their answer. If, \
+         and only if, the user explicitly says to stop asking for the rest of this session, also \
+         pass allow_rest_of_session: true; never set it on your own. The code works once and \
+         expires in {} minutes. If they decline, do nothing.",
         APPROVAL_WINDOW.as_secs() / 60
     )
 }
@@ -101,6 +122,21 @@ pub async fn ask_then_commit(
     change: PreparedChange,
     keep_newest: usize,
 ) -> Result<String> {
+    if let Some(keep_backup) = pending.session_backup_choice()
+        && change.reason_to_ask_anyway().is_none()
+    {
+        let report = commit(
+            &change,
+            BackupPolicy {
+                keep_backup,
+                keep_newest,
+            },
+        )?;
+        return Ok(format!(
+            "Applied without asking, because the user allowed config changes for the rest of this \
+             session. Tell them what changed.\n{report}"
+        ));
+    }
     if !peer
         .supported_elicitation_modes()
         .contains(&ElicitationMode::Form)
@@ -109,7 +145,8 @@ pub async fn ask_then_commit(
     }
     let question = format!(
         "umbriel-mcp wants to change your Umbriel config.\n\n{}\n\nApply this change? You can \
-         also choose whether to keep a backup of the previous config.",
+         also choose whether to keep a backup of the previous config, and whether to stop \
+         asking for further changes in this session.",
         change.preview()
     );
     let not_written =
@@ -121,13 +158,19 @@ pub async fn ask_then_commit(
         Ok(Some(WriteApproval {
             apply: true,
             backup,
-        })) => commit(
-            &change,
-            BackupPolicy {
-                keep_backup: backup,
-                keep_newest,
-            },
-        ),
+            allow_rest_of_session,
+        })) => {
+            if allow_rest_of_session {
+                pending.allow_rest_of_session(backup);
+            }
+            commit(
+                &change,
+                BackupPolicy {
+                    keep_backup: backup,
+                    keep_newest,
+                },
+            )
+        }
         Ok(_)
         | Err(ElicitationError::UserDeclined)
         | Err(ElicitationError::UserCancelled)

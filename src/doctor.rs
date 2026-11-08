@@ -31,6 +31,8 @@ pub struct ProtocolGlobals {
 #[derive(Clone, Debug)]
 pub struct Facts {
     pub compositor_socket: Result<String, String>,
+    pub action_protocol: Option<ipc::Protocol>,
+    pub grim_captures_any_window: bool,
     pub protocols: Result<ProtocolGlobals, String>,
     pub grim_installed: bool,
     pub recorder_installed: bool,
@@ -188,7 +190,18 @@ fn how_to_install(distribution: Distribution, prerequisite: Prerequisite) -> Str
 
 fn socket_check(facts: &Facts) -> Check {
     match &facts.compositor_socket {
-        Ok(path) => Check::ready(SOCKET_CHECK, format!("reachable at {path}")),
+        Ok(path) => {
+            let actions = match facts.action_protocol {
+                Some(ipc::Protocol::TypedActions) => {
+                    "; actions use typed requests (Umbriel from late October 2026 on)"
+                }
+                Some(ipc::Protocol::NameColonArgument) => {
+                    "; actions use the older name:argument form"
+                }
+                None => "",
+            };
+            Check::ready(SOCKET_CHECK, format!("reachable at {path}{actions}"))
+        }
         Err(problem) => Check::failing(
             SOCKET_CHECK,
             problem.clone(),
@@ -240,6 +253,33 @@ fn program_check(
     }
 }
 
+fn grim_check(facts: &Facts) -> Check {
+    let check = program_check(
+        GRIM_CHECK,
+        "grim",
+        facts.grim_installed,
+        facts.distribution,
+        Prerequisite::Grim,
+    );
+    match check.outcome {
+        Outcome::Ready(found) if facts.grim_captures_any_window => Check::ready(
+            GRIM_CHECK,
+            format!("{found}; captures any window, even on a hidden workspace"),
+        ),
+        Outcome::Ready(found) => Check::ready(
+            GRIM_CHECK,
+            format!(
+                "{found}, but it is older than 1.5, so a window can be captured only while it is \
+                 fully on screen and uncovered; grim 1.5 or newer captures any window"
+            ),
+        ),
+        failing => Check {
+            name: GRIM_CHECK,
+            outcome: failing,
+        },
+    }
+}
+
 fn english_data_check(facts: &Facts) -> Check {
     let fix = how_to_install(facts.distribution, Prerequisite::EnglishData);
     match &facts.tesseract_languages {
@@ -279,13 +319,7 @@ pub fn diagnose(facts: &Facts) -> Vec<Check> {
             facts,
             |globals| globals.virtual_keyboard,
         ),
-        program_check(
-            GRIM_CHECK,
-            "grim",
-            facts.grim_installed,
-            facts.distribution,
-            Prerequisite::Grim,
-        ),
+        grim_check(facts),
         program_check(
             TESSERACT_CHECK,
             "tesseract",
@@ -378,10 +412,17 @@ fn protocol_fact() -> Result<ProtocolGlobals, String> {
 fn gather_facts() -> Facts {
     let tesseract_installed = is_on_path("tesseract");
     let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let compositor_socket = compositor_socket_fact();
+    let grim_installed = is_on_path("grim");
     Facts {
-        compositor_socket: compositor_socket_fact(),
+        action_protocol: compositor_socket
+            .is_ok()
+            .then(|| ipc::detect_protocol().ok())
+            .flatten(),
+        grim_captures_any_window: grim_installed && crate::screen::grim_supports_toplevel_capture(),
+        compositor_socket,
         protocols: protocol_fact(),
-        grim_installed: is_on_path("grim"),
+        grim_installed,
         recorder_installed: is_on_path("wf-recorder"),
         tesseract_installed,
         tesseract_languages: tesseract_installed.then(list_tesseract_languages).flatten(),
@@ -410,6 +451,8 @@ mod tests {
     fn healthy_facts() -> Facts {
         Facts {
             compositor_socket: Ok("/run/user/1000/umbriel-wayland-0.sock".to_owned()),
+            action_protocol: Some(crate::ipc::Protocol::TypedActions),
+            grim_captures_any_window: true,
             protocols: Ok(ProtocolGlobals {
                 virtual_pointer: true,
                 virtual_keyboard: true,
@@ -717,5 +760,26 @@ mod tests {
             fix.contains("wf-recorder") && !fix.contains("pacman"),
             "{fix}"
         );
+    }
+
+    #[test]
+    fn an_older_grim_passes_but_says_what_it_cannot_capture() {
+        let mut facts = healthy_facts();
+        facts.grim_captures_any_window = false;
+        let checks = diagnose(&facts);
+        match &check(&checks, "Screen capture (grim)").outcome {
+            Outcome::Ready(detail) => assert!(detail.contains("older than 1.5"), "{detail}"),
+            other => panic!("expected ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_socket_check_names_the_action_protocol() {
+        let mut facts = healthy_facts();
+        facts.action_protocol = Some(crate::ipc::Protocol::NameColonArgument);
+        match &check(&diagnose(&facts), "Umbriel socket").outcome {
+            Outcome::Ready(detail) => assert!(detail.contains("name:argument"), "{detail}"),
+            other => panic!("expected ready, got {other:?}"),
+        }
     }
 }

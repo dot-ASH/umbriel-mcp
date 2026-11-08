@@ -86,6 +86,16 @@ impl FakeUmbriel {
         Self::start_with_focus(replies, Focus::Immediate)
     }
 
+    pub fn start_with_protocol(replies: HashMap<String, Value>, protocol: Protocol) -> Self {
+        let fake = Self::start(replies);
+        fake.set_protocol(protocol);
+        fake
+    }
+
+    pub fn set_protocol(&self, protocol: Protocol) {
+        self.state.lock().expect("fake state lock").protocol = protocol;
+    }
+
     pub fn start_with_focus(replies: HashMap<String, Value>, focus: Focus) -> Self {
         let path = std::env::temp_dir().join(format!(
             "umbriel-mcp-test-{}-{}.sock",
@@ -105,6 +115,7 @@ impl FakeUmbriel {
             replies,
             focus,
             pending_focus: None,
+            protocol: Protocol::NameColonArgument,
         }));
         let worker_state = Arc::clone(&state);
         let worker = thread::spawn(move || {
@@ -167,6 +178,13 @@ fn unique_suffix() -> String {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    NameColonArgument,
+    TypedActions,
+    Unknown,
+}
+
 #[derive(Clone, Copy)]
 pub enum Focus {
     Immediate,
@@ -178,6 +196,22 @@ struct FakeState {
     replies: HashMap<String, Value>,
     focus: Focus,
     pending_focus: Option<(String, Instant)>,
+    protocol: Protocol,
+}
+
+impl FakeState {
+    fn refusal(&self, command: &str, request: &Value) -> Option<Value> {
+        let unknown = || Some(json!({"err": format!("unknown command: {command}")}));
+        match (self.protocol, command) {
+            (Protocol::Unknown, "msg" | "action") => unknown(),
+            (Protocol::NameColonArgument, "action") => unknown(),
+            (Protocol::TypedActions, "msg") => unknown(),
+            (Protocol::TypedActions, "action") if request.get("action").is_none() => {
+                Some(json!({"err": "missing \"action\""}))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl FakeState {
@@ -230,6 +264,11 @@ fn handle_fake_request(
         .get("arg")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if let Some(refusal) = state.refusal(command, &request) {
+        let mut stream = stream.into_inner();
+        let _ = writeln!(stream, "{refusal}");
+        return;
+    }
     if command == "msg"
         && let Some(window_id) = action
             .strip_prefix("window-focus-warp:")
@@ -237,12 +276,23 @@ fn handle_fake_request(
     {
         state.request_focus(window_id);
     }
+    let typed_action = request.get("action").and_then(Value::as_str);
+    if command == "action"
+        && matches!(typed_action, Some("window-focus" | "window-focus-warp"))
+        && let Some(window_id) = request.get("window").and_then(Value::as_str)
+    {
+        state.request_focus(window_id);
+    }
     state.apply_due_focus();
-    let response = state
-        .replies
-        .get(command)
-        .cloned()
-        .unwrap_or_else(|| json!({"ok": []}));
+    let response = if command == "action" {
+        json!({"ok": null})
+    } else {
+        state
+            .replies
+            .get(command)
+            .cloned()
+            .unwrap_or_else(|| json!({"ok": []}))
+    };
     let mut stream = stream.into_inner();
     let _ = writeln!(stream, "{response}");
 }

@@ -3,7 +3,7 @@ mod support;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use support::{FakeUmbriel, Focus, McpProcess, error_message, text_content};
+use support::{FakeUmbriel, Focus, McpProcess, Protocol, error_message, text_content};
 
 fn canned_replies() -> HashMap<String, Value> {
     HashMap::from([
@@ -2817,4 +2817,449 @@ fn the_instructions_ask_agents_to_share_the_desktop_carefully() {
             "missing {expected:?}: {instructions}"
         );
     }
+}
+
+fn allow_for_the_session() -> Value {
+    json!({"action": "accept", "content": {"apply": true, "allow_rest_of_session": true}})
+}
+
+#[test]
+fn the_dialog_offers_to_stop_asking_for_the_session_unticked_by_default() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let approve = json!({"action": "accept", "content": {"apply": true}});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    server.call_tool("set_option", json!({"key":"layout.gap","value":14}));
+
+    let field = &server.approval_forms[0]["properties"]["allow_rest_of_session"];
+    assert_eq!(field["type"], "boolean", "{:?}", server.approval_forms);
+    assert_eq!(field["default"], false, "{:?}", server.approval_forms);
+    assert_eq!(
+        server.approval_questions.len(),
+        2,
+        "without the tick every change asks"
+    );
+}
+
+#[test]
+fn allowing_the_session_applies_later_changes_without_asking() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) =
+        start_editor(&home, "full", two_outputs(), Some(allow_for_the_session()));
+
+    server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+F","action":"window-close"}),
+    );
+    let later = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+
+    assert_eq!(
+        server.approval_questions.len(),
+        1,
+        "{:?}",
+        server.approval_questions
+    );
+    let report = text_content(&later);
+    assert!(report.contains("without asking"), "{report}");
+    assert!(report.contains("gap"), "{report}");
+    let config = current_config(&home);
+    assert!(
+        config.contains("\"Mod+F\" = \"window-close\"") && config.contains("gap = 12"),
+        "{config}"
+    );
+}
+
+#[test]
+fn changes_that_start_programs_or_carry_a_caution_still_ask_after_allowing_the_session() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) =
+        start_editor(&home, "full", two_outputs(), Some(allow_for_the_session()));
+
+    server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    server.call_tool(
+        "set_keybind",
+        json!({"chord":"Mod+B","action":"spawn:firefox"}),
+    );
+
+    assert_eq!(
+        server.approval_questions.len(),
+        2,
+        "{:?}",
+        server.approval_questions
+    );
+    assert!(
+        server.approval_questions[1].contains("spawn:firefox"),
+        "{:?}",
+        server.approval_questions
+    );
+}
+
+#[test]
+fn a_new_session_asks_again() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    {
+        let (_fake, mut server) =
+            start_editor(&home, "full", two_outputs(), Some(allow_for_the_session()));
+        server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    }
+    let approve = json!({"action": "accept", "content": {"apply": true}});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    server.call_tool("set_option", json!({"key":"layout.gap","value":14}));
+
+    assert_eq!(server.approval_questions.len(), 1);
+}
+
+#[test]
+fn the_code_path_can_allow_the_rest_of_the_session_when_the_user_says_so() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), None);
+
+    let first = server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    let code = confirmation_code(&first).expect("a confirmation code");
+    assert!(
+        text_content(&first).contains("allow_rest_of_session"),
+        "{first}"
+    );
+    server.call_text(
+        "apply_config_change",
+        json!({"confirmation": code, "allow_rest_of_session": true}),
+    );
+    let later = server.call_tool("set_option", json!({"key":"layout.gap","value":14}));
+
+    assert!(confirmation_code(&later).is_none(), "{later}");
+    assert!(text_content(&later).contains("without asking"), "{later}");
+    assert!(current_config(&home).contains("gap = 14"));
+}
+
+#[test]
+fn later_changes_in_an_allowed_session_reuse_the_backup_choice() {
+    for (keep_backup, expected_backups) in [(false, 0), (true, 3)] {
+        let home = home_with_config(KEYBIND_CONFIG);
+        let approve = json!({"action": "accept", "content": {
+            "apply": true, "backup": keep_backup, "allow_rest_of_session": true
+        }});
+        let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+        for gap in [12, 14, 16] {
+            server.call_tool("set_option", json!({"key":"layout.gap","value":gap}));
+        }
+
+        assert_eq!(server.approval_questions.len(), 1, "backup {keep_backup}");
+        assert_eq!(
+            backups(&home),
+            expected_backups,
+            "backup {keep_backup}: {:?}",
+            files_beside_config(&home)
+        );
+    }
+}
+
+fn typed_actions(fake: &FakeUmbriel) -> Vec<Value> {
+    fake.requests()
+        .into_iter()
+        .filter(|request| request["cmd"] == "action" && request.get("action").is_some())
+        .collect()
+}
+
+fn umbriel_cli_recording_messages(tools: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let record = tools.join("umbriel.msg");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = msg ]; then shift; for word in \"$@\"; do printf '%s\\n' \"$word\" >> '{}'; done; echo --- >> '{}'; exit 0; fi\necho \"umbriel 0.1.0 (c6ad18d5ed7e)\"\n",
+        record.display(),
+        record.display()
+    );
+    let path = tools.join("umbriel");
+    std::fs::write(&path, script).expect("write fake umbriel");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    record
+}
+
+fn start_with_protocol(protocol: Protocol) -> (FakeUmbriel, McpProcess, std::path::PathBuf) {
+    let fake = FakeUmbriel::start_with_protocol(canned_replies(), protocol);
+    let tools = fake_tools_directory(None, None);
+    let record = umbriel_cli_recording_messages(&tools);
+    let server = start_without_a_real_display(&fake, &tools);
+    (fake, server, record)
+}
+
+#[test]
+fn newer_umbriel_gets_typed_actions_from_the_dedicated_tools() {
+    let (fake, mut server, _record) = start_with_protocol(Protocol::TypedActions);
+
+    for (tool, arguments) in [
+        (
+            "switch_workspace",
+            json!({"workspace": "2", "output": "DP-1"}),
+        ),
+        ("move_window_to_workspace", json!({"workspace": "web"})),
+        ("focus_window", json!({"window_id": "window-b"})),
+        ("close_window", json!({})),
+        ("set_workspace_layout", json!({"mode": "floating"})),
+        ("resize_window", json!({"edge": "left", "delta": -0.1})),
+        ("launch_app", json!({"command": "kitty --hold"})),
+        ("toggle_overview", json!({})),
+    ] {
+        server.call_text(tool, arguments);
+    }
+
+    assert_eq!(
+        typed_actions(&fake),
+        vec![
+            json!({"cmd": "action", "action": "workspace-switch", "workspace": 2, "output": "DP-1"}),
+            json!({"cmd": "action", "action": "window-move-to-workspace", "workspace": "web"}),
+            json!({"cmd": "action", "action": "window-focus", "window": "window-b"}),
+            json!({"cmd": "action", "action": "window-close"}),
+            json!({"cmd": "action", "action": "workspace-set-layout", "layout": "stacking"}),
+            json!({"cmd": "action", "action": "window-modify-width-left", "delta": -0.1}),
+            json!({"cmd": "action", "action": "spawn", "command": "kitty --hold"}),
+            json!({"cmd": "action", "action": "overview-toggle"}),
+        ]
+    );
+    assert!(compositor_actions(&fake).is_empty());
+}
+
+fn messages_sent_through_the_umbriel_command(record: &std::path::Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .split("---\n")
+        .filter(|message| !message.is_empty())
+        .map(|message| message.lines().map(str::to_owned).collect())
+        .collect()
+}
+
+#[test]
+fn on_newer_umbriel_run_action_takes_either_syntax_through_the_umbriel_command() {
+    let (_fake, mut server, record) = start_with_protocol(Protocol::TypedActions);
+
+    for action in [
+        "workspace-switch 2 --output DP-1",
+        "workspace-switch:2/DP-1",
+        "spawn sh -c 'echo hi'",
+    ] {
+        server.call_text("run_action", json!({"action": action}));
+    }
+
+    assert_eq!(
+        messages_sent_through_the_umbriel_command(&record),
+        vec![
+            vec!["workspace-switch", "2", "--output", "DP-1"],
+            vec!["workspace-switch", "2", "--output", "DP-1"],
+            vec!["spawn", "sh -c 'echo hi'"],
+        ]
+    );
+}
+
+#[test]
+fn on_older_umbriel_run_action_takes_either_syntax_as_name_colon_argument() {
+    let (fake, mut server, _record) = start_with_protocol(Protocol::NameColonArgument);
+
+    server.call_text(
+        "run_action",
+        json!({"action": "workspace-switch 2 --output DP-1"}),
+    );
+    server.call_text("run_action", json!({"action": "window-focus:abc"}));
+
+    assert_eq!(
+        compositor_actions(&fake),
+        vec!["workspace-switch:2/DP-1", "window-focus:abc"]
+    );
+}
+
+#[test]
+fn an_umbriel_upgraded_while_the_server_runs_is_noticed() {
+    let (fake, mut server, _record) = start_with_protocol(Protocol::NameColonArgument);
+
+    server.call_text("toggle_overview", json!({}));
+    fake.set_protocol(Protocol::TypedActions);
+    server.call_text("toggle_overview", json!({}));
+
+    assert_eq!(
+        compositor_actions(&fake),
+        vec!["overview-toggle", "overview-toggle"],
+        "the second old-style attempt is the one the upgraded Umbriel rejected"
+    );
+    assert_eq!(
+        typed_actions(&fake),
+        vec![json!({"cmd": "action", "action": "overview-toggle"})]
+    );
+}
+
+#[test]
+fn an_umbriel_that_accepts_neither_protocol_gets_a_clear_explanation() {
+    let (_fake, mut server, _record) = start_with_protocol(Protocol::Unknown);
+
+    let response = server.call_tool("toggle_overview", json!({}));
+
+    let message = error_message(&response);
+    assert!(message.contains("IPC protocol has changed"), "{message}");
+    assert!(message.contains("c6ad18d5ed7e"), "{message}");
+    assert!(message.contains("umbriel-mcp update"), "{message}");
+}
+
+#[test]
+fn no_focused_window_is_reported_as_such_rather_than_as_a_failure() {
+    let mut replies = canned_replies();
+    replies.insert(
+        "focused-window".to_owned(),
+        json!({"err": "no focused window"}),
+    );
+    let fake = FakeUmbriel::start_with_protocol(replies, Protocol::TypedActions);
+    let tools = fake_tools_directory(None, None);
+    let mut server = start_without_a_real_display(&fake, &tools);
+
+    let active = server.call_text("get_active_window", json!({}));
+    let typed = server.call_tool("type_text", json!({"text": "x", "window_id": "window-a"}));
+
+    assert_eq!(active.trim(), "null");
+    assert!(
+        error_message(&typed).contains("no window has it"),
+        "{typed}"
+    );
+}
+
+fn desktop_with_scrolling_and_overlays(layers: Value) -> HashMap<String, Value> {
+    HashMap::from([
+        (
+            "windows".to_owned(),
+            json!({"ok": [
+                { "id": "editor", "app_id": "zed", "pid": 100, "output": "DP-1", "workspace": "DP-1:1",
+                  "visible": true, "floating": false, "x": 1932, "y": 46, "w": 900, "h": 500 },
+                { "id": "browser", "app_id": "Firefox", "pid": 200, "output": "DP-1", "workspace": "DP-1:1",
+                  "visible": true, "floating": false, "x": 3400, "y": 46, "w": 900, "h": 500 },
+                { "id": "notes", "app_id": "obsidian", "pid": 300, "output": "DP-1", "workspace": "DP-1:1",
+                  "visible": true, "floating": false, "x": 5000, "y": 46, "w": 900, "h": 500 },
+                { "id": "chat", "app_id": "teams", "pid": 400, "output": "HDMI-A-1", "workspace": "HDMI-A-1:3",
+                  "visible": false, "floating": false, "x": 12, "y": 46, "w": 900, "h": 500 }
+            ]}),
+        ),
+        (
+            "outputs".to_owned(),
+            json!({"ok": [
+                { "name": "HDMI-A-1", "position": {"x": 0, "y": 0}, "logical_size": {"width": 1920, "height": 1080} },
+                { "name": "DP-1", "position": {"x": 1920, "y": 0}, "logical_size": {"width": 1920, "height": 1080} }
+            ]}),
+        ),
+        ("layers".to_owned(), json!({ "ok": layers })),
+        ("focused-window".to_owned(), json!({"ok": {"id": "editor"}})),
+    ])
+}
+
+fn session_menu_over_the_editor() -> Value {
+    json!([{ "layer": "overlay", "namespace": "noctalia-session-menu", "mapped": true,
+             "keyboard_interactivity": "exclusive", "x": 2100, "y": 100, "w": 600, "h": 400 }])
+}
+
+fn start_with_older_grim(layers: Value) -> (FakeUmbriel, McpProcess, std::path::PathBuf) {
+    let fake = FakeUmbriel::start(desktop_with_scrolling_and_overlays(layers));
+    let tools = fake_tools_directory(None, None);
+    let record = recording_grim(&tools, false);
+    let server = start_without_a_real_display(&fake, &tools);
+    (fake, server, record)
+}
+
+#[test]
+fn older_grim_refuses_a_window_scrolled_out_of_view_instead_of_capturing_what_is_there() {
+    let (_fake, mut server, record) = start_with_older_grim(json!([]));
+
+    for window in ["browser", "notes"] {
+        let response = server.call_tool("screenshot", json!({"window_id": window}));
+        let message = error_message(&response);
+        assert!(
+            message.contains("scrolled out of view"),
+            "{window}: {message}"
+        );
+        assert!(message.contains("focus_window"), "{window}: {message}");
+    }
+    assert!(!grim_arguments(&record).contains(&"-g".to_owned()));
+}
+
+#[test]
+fn older_grim_refuses_a_window_hidden_under_a_menu_instead_of_capturing_the_menu() {
+    let (_fake, mut server, record) = start_with_older_grim(session_menu_over_the_editor());
+
+    let response = server.call_tool("screenshot", json!({"window_id": "editor"}));
+
+    let message = error_message(&response);
+    assert!(message.contains("noctalia-session-menu"), "{message}");
+    assert!(!grim_arguments(&record).contains(&"-g".to_owned()));
+}
+
+#[test]
+fn older_grim_says_a_screen_area_capture_includes_whatever_is_on_top() {
+    let (_fake, mut server, record) = start_with_older_grim(json!([]));
+
+    let note = server.call_text("screenshot", json!({"window_id": "editor"}));
+
+    assert!(
+        note.contains("anything drawn on top of it is included"),
+        "{note}"
+    );
+    assert!(
+        grim_arguments(&record)
+            .windows(2)
+            .any(|pair| pair == ["-g", "1932,46 900x500"])
+    );
+}
+
+#[test]
+fn clicks_on_a_covered_or_scrolled_away_point_are_refused() {
+    let fake = FakeUmbriel::start(desktop_with_scrolling_and_overlays(
+        session_menu_over_the_editor(),
+    ));
+    let tools = fake_tools_directory(None, None);
+    let mut server = start_without_a_real_display(&fake, &tools);
+
+    let covered = server.call_tool(
+        "mouse_click",
+        json!({"window_id": "editor", "x": 300, "y": 200}),
+    );
+    let scrolled_away = server.call_tool(
+        "mouse_click",
+        json!({"window_id": "browser", "x": 800, "y": 100}),
+    );
+    let reachable = server.call_tool(
+        "mouse_click",
+        json!({"window_id": "browser", "x": 100, "y": 100}),
+    );
+
+    assert!(
+        error_message(&covered).contains("noctalia-session-menu"),
+        "{covered}"
+    );
+    assert!(
+        error_message(&scrolled_away).contains("scrolled out of view"),
+        "{scrolled_away}"
+    );
+    assert!(
+        error_message(&reachable).contains("could not move the pointer"),
+        "{reachable}"
+    );
+}
+
+#[test]
+fn the_brief_listing_says_how_much_of_each_window_is_on_screen_and_filters_by_app_and_pid() {
+    let fake = FakeUmbriel::start(desktop_with_scrolling_and_overlays(json!([])));
+    let mut server = McpProcess::start(&fake.path);
+
+    let all = listed_json(&mut server, "list_windows", json!({}));
+    let firefox = listed_json(&mut server, "list_windows", json!({"app_id": "firefox"}));
+    let by_pid = listed_json(&mut server, "list_windows", json!({"pid": 300}));
+
+    let on_screen: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|window| window["on_screen"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        on_screen,
+        ["fully", "partly", "scrolled_out_of_view", "hidden"]
+    );
+    assert_eq!(firefox.as_array().unwrap().len(), 1);
+    assert_eq!(firefox[0]["id"], "browser");
+    assert_eq!(by_pid.as_array().unwrap().len(), 1);
+    assert_eq!(by_pid[0]["id"], "notes");
 }

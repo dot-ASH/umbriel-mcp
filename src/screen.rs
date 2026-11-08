@@ -1,3 +1,4 @@
+use crate::placement::OnScreen;
 use anyhow::{Context, Result, anyhow};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
@@ -136,6 +137,7 @@ pub struct Capture {
     pub captured_at: SystemTime,
     pub window_title: Option<String>,
     pub fingerprint: Fingerprint,
+    pub notes: Vec<String>,
 }
 
 impl Capture {
@@ -165,6 +167,7 @@ impl Capture {
             captured_at: SystemTime::now(),
             window_title: None,
             fingerprint,
+            notes: Vec::new(),
         })
     }
 
@@ -188,12 +191,7 @@ impl Capture {
 
     pub fn coordinate_note(&self) -> String {
         let factor = self.native_width as f64 / self.encoded_width.max(1) as f64;
-        let visibility = if self.shown_on_screen {
-            ""
-        } else {
-            " The window is not currently shown (its workspace is hidden or it is minimized), \
-             so these screen coordinates only apply after switching to its workspace."
-        };
+        let visibility: String = self.notes.iter().map(|note| format!(" {note}")).collect();
         format!(
             "Image is {}x{} covering a {}x{} region whose top-left is absolute ({}, {}). \
              To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}. \
@@ -263,7 +261,7 @@ fn output_origin(output_name: &str) -> (i64, i64) {
     (0, 0)
 }
 
-fn grim_supports_toplevel_capture() -> bool {
+pub fn grim_supports_toplevel_capture() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         Command::new("grim")
@@ -277,35 +275,98 @@ fn grim_supports_toplevel_capture() -> bool {
     })
 }
 
-fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlacement)> {
-    let placement = crate::ipc::window_placement(window_id)?;
-    let png = if grim_supports_toplevel_capture() {
-        grim(&["-T".into(), window_id.to_owned()]).map_err(|error| {
-            if error.to_string().contains("cannot find toplevel") {
-                anyhow!("no window with id {window_id} can be captured")
-            } else {
-                error
-            }
-        })?
-    } else if placement.shown_on_screen {
-        grim(&["-g".into(), placement.geometry.clone()])?
-    } else {
+fn visibility_note(window_id: &str, on_screen: OnScreen) -> Option<String> {
+    match on_screen {
+        OnScreen::FullyInView => None,
+        OnScreen::Hidden => Some(
+            "The window is not currently shown (its workspace is hidden or it is minimized), so \
+             these screen coordinates only apply after switching to its workspace."
+                .to_owned(),
+        ),
+        OnScreen::PartlyInView | OnScreen::ScrolledOutOfView => Some(format!(
+            "The window is partly or entirely scrolled out of view, so some of these screen \
+             coordinates are off screen; call focus_window with {window_id} to bring it into \
+             view before clicking."
+        )),
+    }
+}
+
+const OLDER_GRIM: &str = "capturing a window by itself needs grim 1.5 or newer (`grim -T`); \
+                          this grim can only capture what is displayed";
+
+fn capture_from_screen(
+    window_id: &str,
+    placement: &crate::ipc::WindowPlacement,
+) -> Result<(Vec<u8>, Vec<String>)> {
+    match placement.on_screen {
+        OnScreen::Hidden => {
+            return Err(anyhow!(
+                "window {window_id} is not currently shown, and {OLDER_GRIM}. Switch to its \
+                 workspace first, or upgrade grim."
+            ));
+        }
+        OnScreen::PartlyInView | OnScreen::ScrolledOutOfView => {
+            return Err(anyhow!(
+                "window {window_id} is partly or entirely scrolled out of view, and \
+                 {OLDER_GRIM}. Call focus_window to bring it into view first, or upgrade grim."
+            ));
+        }
+        OnScreen::FullyInView => {}
+    }
+    if let Some(cover) = placement
+        .drawn_over
+        .iter()
+        .find(|cover| cover.hides_most_of_it)
+    {
         return Err(anyhow!(
-            "window {window_id} is not currently shown, and capturing a window that is not on \
-             screen needs grim 1.5 or newer (`grim -T`); this grim can only capture what is \
-             displayed. Switch to its workspace first, or upgrade grim."
+            "window {window_id} is covered by {}, and {OLDER_GRIM}, so the picture would show \
+             that instead of the window. Close it first, or upgrade grim.",
+            cover.description
         ));
-    };
-    Ok((png, placement))
+    }
+    let mut notes = vec![
+        "This grim (older than 1.5) cannot capture a window by itself, so this is the screen \
+         area the window occupies: anything drawn on top of it is included."
+            .to_owned(),
+    ];
+    if !placement.drawn_over.is_empty() {
+        let overlapping: Vec<&str> = placement
+            .drawn_over
+            .iter()
+            .map(|cover| cover.description.as_str())
+            .collect();
+        notes.push(format!("Partly covered by {}.", overlapping.join(", ")));
+    }
+    Ok((grim(&["-g".into(), placement.geometry.clone()])?, notes))
+}
+
+fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlacement, Vec<String>)> {
+    let placement = crate::ipc::window_placement(window_id)?;
+    if !grim_supports_toplevel_capture() {
+        let (png, notes) = capture_from_screen(window_id, &placement)?;
+        return Ok((png, placement, notes));
+    }
+    let png = grim(&["-T".into(), window_id.to_owned()]).map_err(|error| {
+        if error.to_string().contains("cannot find toplevel") {
+            anyhow!("no window with id {window_id} can be captured")
+        } else {
+            error
+        }
+    })?;
+    let notes = visibility_note(window_id, placement.on_screen)
+        .into_iter()
+        .collect();
+    Ok((png, placement, notes))
 }
 
 pub fn capture(area: &Area, max_width: u32) -> Result<Capture> {
     let (png, origin) = match area {
         Area::Window(id) => {
-            let (png, placement) = capture_window(id)?;
+            let (png, placement, notes) = capture_window(id)?;
             let mut capture = Capture::from_png(&png, placement.origin, max_width)?;
             capture.shown_on_screen = placement.shown_on_screen;
             capture.window_title = placement.title;
+            capture.notes = notes;
             return Ok(capture);
         }
         Area::Output(name) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),

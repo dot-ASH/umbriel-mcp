@@ -1,3 +1,4 @@
+mod actions;
 mod approval;
 mod capture_target;
 mod compositor;
@@ -7,6 +8,7 @@ mod input;
 mod ipc;
 mod keyboard;
 mod listing;
+mod placement;
 mod profile;
 mod recording;
 mod register;
@@ -46,7 +48,7 @@ const FOCUS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const FOCUS_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 fn focused_window_id() -> Option<String> {
-    ipc::query("focused-window")
+    ipc::focused_window()
         .ok()?
         .get("id")?
         .as_str()
@@ -76,7 +78,7 @@ fn wait_for_keyboard_focus(window_id: &str) -> anyhow::Result<String> {
 }
 
 fn focus_report() -> String {
-    match ipc::query("focused-window") {
+    match ipc::focused_window() {
         Ok(window)
             if window
                 .get("id")
@@ -103,7 +105,7 @@ fn focus_report() -> String {
 }
 
 fn require_keyboard_focus(window_id: &str, nothing_done: &str) -> Result<(), ErrorData> {
-    let focused = ipc::query("focused-window").map_err(failed)?;
+    let focused = ipc::focused_window().map_err(failed)?;
     let holder = focused.get("id").and_then(serde_json::Value::as_str);
     if holder == Some(window_id) {
         return Ok(());
@@ -135,17 +137,44 @@ fn require_keyboard_focus(window_id: &str, nothing_done: &str) -> Result<(), Err
     ))
 }
 
-fn point_in_window(window_id: &str, x: i32, y: i32) -> Result<(i32, i32), ErrorData> {
-    let placement = ipc::window_placement(window_id).map_err(failed)?;
+fn refuse_unreachable_point(
+    window_id: &str,
+    placement: &ipc::WindowPlacement,
+    x: i64,
+    y: i64,
+) -> Result<(), ErrorData> {
+    let refusal = |reason: String| Err(ErrorData::invalid_params(reason, None));
     if !placement.shown_on_screen {
-        return Err(ErrorData::invalid_params(
-            format!(
-                "window {window_id} is not on screen, so the pointer would land on whatever is \
-                 shown there; switch to its workspace or call focus_window first"
-            ),
-            None,
+        return refusal(format!(
+            "window {window_id} is not on screen, so the pointer would land on whatever is shown \
+             there; switch to its workspace or call focus_window first"
         ));
     }
+    if placement
+        .output_area
+        .is_some_and(|area| !area.contains_point(x, y))
+    {
+        return refusal(format!(
+            "screen point ({x}, {y}) of window {window_id} is scrolled out of view; call \
+             focus_window to bring the window into view, then look again"
+        ));
+    }
+    if let Some(cover) = placement
+        .drawn_over
+        .iter()
+        .find(|cover| cover.area.contains_point(x, y))
+    {
+        return refusal(format!(
+            "screen point ({x}, {y}) of window {window_id} is covered by {}, so the click would \
+             land on that instead",
+            cover.description
+        ));
+    }
+    Ok(())
+}
+
+fn point_in_window(window_id: &str, x: i32, y: i32) -> Result<(i32, i32), ErrorData> {
+    let placement = ipc::window_placement(window_id).map_err(failed)?;
     let (width, height) = placement.size;
     if x < 0 || y < 0 || i64::from(x) >= width || i64::from(y) >= height {
         return Err(ErrorData::invalid_params(
@@ -156,10 +185,10 @@ fn point_in_window(window_id: &str, x: i32, y: i32) -> Result<(i32, i32), ErrorD
             None,
         ));
     }
-    Ok((
-        (placement.origin.0 + i64::from(x)) as i32,
-        (placement.origin.1 + i64::from(y)) as i32,
-    ))
+    let screen_x = placement.origin.0 + i64::from(x);
+    let screen_y = placement.origin.1 + i64::from(y);
+    refuse_unreachable_point(window_id, &placement, screen_x, screen_y)?;
+    Ok((screen_x as i32, screen_y as i32))
 }
 
 fn pointer_target(
@@ -203,9 +232,22 @@ fn crashed_tool_error(tool: &str, crash: tokio::task::JoinError) -> ErrorData {
     )
 }
 
-fn acted(action: String) -> Result<String, ErrorData> {
-    ipc::dispatch(&action).map_err(failed)?;
-    Ok(format!("ok: {action}"))
+fn setting_that_always_asks(key: &str, value: &serde_json::Value) -> Option<&'static str> {
+    match setting::policy(key.trim()) {
+        setting::Policy::RunsProgramsOrLoadsFiles => {
+            Some("this setting can start programs or load files")
+        }
+        setting::Policy::WeakensSecurity => Some("this setting can weaken a security check"),
+        setting::Policy::TakesAnAction if value.as_str().is_some_and(profile::is_spawn_action) => {
+            Some("it starts a program")
+        }
+        _ => None,
+    }
+}
+
+fn acted(action: actions::CompositorAction) -> Result<String, ErrorData> {
+    ipc::perform(&action).map_err(failed)?;
+    Ok(format!("ok: {}", action.summary()))
 }
 
 fn workspace_matches(window_workspace: &str, wanted: &str) -> bool {
@@ -220,13 +262,6 @@ fn refused(reason: String) -> ErrorData {
     ErrorData::invalid_request(reason, None)
 }
 
-fn with_optional_target(base: &str, target: &Option<String>) -> String {
-    match target {
-        Some(value) if !value.is_empty() => format!("{base}:{value}"),
-        _ => base.to_string(),
-    }
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WindowFilter {
     /// Also include every field Umbriel reports (effects, tabs, scratchpad and so on); omit for
@@ -237,6 +272,10 @@ struct WindowFilter {
     workspace: Option<String>,
     /// Only list windows on this output, such as "DP-1"
     output: Option<String>,
+    /// Only list windows of this application id, such as "firefox" (case does not matter)
+    app_id: Option<String>,
+    /// Only list windows owned by this process id
+    pid: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -272,12 +311,13 @@ struct ResizeRequest {
     /// Which edge to move: left, right, up or down
     edge: String,
     /// Signed fraction between -0.9 and 0.9
-    delta: f32,
+    delta: f64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RawAction {
-    /// Any action accepted by `umbriel msg`, such as "overview-toggle"
+    /// An action with its arguments as list_actions shows them, such as "overview-toggle" or
+    /// "workspace-switch 2 --output DP-1"; the older "workspace-switch:2/DP-1" form also works
     action: String,
 }
 
@@ -557,6 +597,9 @@ struct ConfirmationCode {
     confirmation: String,
     /// Whether the user wants a backup of the previous config kept; omit to keep one
     backup: Option<bool>,
+    /// True only if the user explicitly said to stop asking for config changes for the rest of
+    /// this session; never set it on your own
+    allow_rest_of_session: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -572,7 +615,7 @@ struct ClipboardWriteRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct LayoutRequest {
-    /// scrolling, dwindle, master or floating
+    /// scrolling, dwindle, master or stacking (floating on older Umbriel)
     mode: String,
 }
 
@@ -594,15 +637,8 @@ enum Chosen {
     Nothing(String),
 }
 
-fn listed(command: &str) -> Vec<serde_json::Value> {
-    ipc::query(command)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-}
-
 fn focused_or_first_output() -> anyhow::Result<String> {
-    let outputs = listed("outputs");
+    let outputs = ipc::listed("outputs");
     let enabled = || {
         outputs.iter().filter(|output| {
             output.get("enabled").and_then(serde_json::Value::as_bool) != Some(false)
@@ -673,8 +709,11 @@ impl UmbrielServer {
             });
         }
         let ask_length = purpose == Purpose::Recording && seconds.is_none();
-        let choices =
-            capture_target::capture_choices(&listed("outputs"), &listed("windows"), purpose);
+        let choices = capture_target::capture_choices(
+            &ipc::listed("outputs"),
+            &ipc::listed("windows"),
+            purpose,
+        );
         match approval::ask_what_to_capture(peer, purpose, &choices, ask_length)
             .await
             .map_err(failed)?
@@ -811,32 +850,39 @@ impl UmbrielServer {
 #[tool_router]
 impl UmbrielServer {
     #[tool(
-        description = "List the windows open on this desktop with id, app_id, title, geometry, monitor, workspace and has_keyboard_focus (pass detail for every field Umbriel reports). Use it to answer what is open or what is on workspace 4; pass workspace \"4\" for that workspace on every monitor."
+        description = "List the windows open on this desktop with id, app_id, title, geometry, monitor and workspace; filter by workspace, output, app_id or pid. Use it to answer what is open or what is on workspace 4; pass workspace \"4\" for that workspace on every monitor. has_keyboard_focus is true for the one window that receives typing. on_screen is fully, partly, scrolled_out_of_view (on the shown workspace but scrolled away) or hidden (another workspace, minimized or a hidden tab). Umbriel's own visible means only that its workspace is shown, and its focused is each workspace's remembered focus, true on several windows at once; detail adds those and every other field Umbriel reports."
     )]
     fn list_windows(
         &self,
         Parameters(filter): Parameters<WindowFilter>,
     ) -> Result<String, ErrorData> {
         let all = ipc::windows().map_err(failed)?;
-        let kept: Vec<_> = all
-            .into_iter()
-            .filter(|entry| {
-                let field = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
-                filter
-                    .workspace
-                    .as_ref()
-                    .is_none_or(|wanted| workspace_matches(field("workspace"), wanted))
-                    && filter
-                        .output
+        let kept: Vec<_> =
+            all.into_iter()
+                .filter(|entry| {
+                    let field = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                    filter
+                        .workspace
                         .as_ref()
-                        .is_none_or(|wanted| field("output") == wanted)
-            })
-            .collect();
+                        .is_none_or(|wanted| workspace_matches(field("workspace"), wanted))
+                        && filter
+                            .output
+                            .as_ref()
+                            .is_none_or(|wanted| field("output") == wanted)
+                        && filter.app_id.as_ref().is_none_or(|wanted| {
+                            field("app_id").eq_ignore_ascii_case(wanted.trim())
+                        })
+                        && filter.pid.is_none_or(|wanted| {
+                            entry.get("pid").and_then(serde_json::Value::as_i64) == Some(wanted)
+                        })
+                })
+                .collect();
         let keyboard_focus = focused_window_id();
+        let outputs = ipc::listed("outputs");
         as_pretty_json(listing::shown(
             serde_json::Value::Array(kept),
             filter.detail.unwrap_or(false),
-            |window| listing::brief_window(window, keyboard_focus.as_deref()),
+            |window| listing::brief_window(window, keyboard_focus.as_deref(), &outputs),
         ))
     }
 
@@ -866,7 +912,8 @@ impl UmbrielServer {
         &self,
         Parameters(request): Parameters<DetailRequest>,
     ) -> Result<String, ErrorData> {
-        let focused = ipc::query("focused-window").map_err(failed)?;
+        let focused = ipc::focused_window().map_err(failed)?;
+        let outputs = ipc::listed("outputs");
         let focused_id = focused
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -874,7 +921,7 @@ impl UmbrielServer {
         as_pretty_json(listing::shown(
             focused,
             request.detail.unwrap_or(false),
-            |window| listing::brief_window(window, focused_id.as_deref()),
+            |window| listing::brief_window(window, focused_id.as_deref(), &outputs),
         ))
     }
 
@@ -890,11 +937,11 @@ impl UmbrielServer {
         &self,
         Parameters(target): Parameters<WorkspaceTarget>,
     ) -> Result<String, ErrorData> {
-        let selector = match &target.output {
-            Some(output) => format!("{}/{}", target.workspace, output),
-            None => target.workspace.clone(),
-        };
-        acted(format!("workspace-switch:{selector}"))
+        acted(actions::CompositorAction::on_workspace(
+            "workspace-switch",
+            &target.workspace,
+            target.output.as_deref(),
+        ))
     }
 
     #[tool(
@@ -910,7 +957,11 @@ impl UmbrielServer {
             "window-focus"
         };
         let window_id = target.window_id.trim().to_owned();
-        ipc::dispatch(&format!("{verb}:{window_id}")).map_err(failed)?;
+        ipc::perform(&actions::CompositorAction::on_window(
+            verb,
+            Some(&window_id),
+        ))
+        .map_err(failed)?;
         let waited = tokio::task::spawn_blocking(move || wait_for_keyboard_focus(&window_id))
             .await
             .map_err(|error| failed(anyhow::anyhow!("the focus check failed: {error}")))?;
@@ -922,7 +973,10 @@ impl UmbrielServer {
         &self,
         Parameters(target): Parameters<WindowTarget>,
     ) -> Result<String, ErrorData> {
-        acted(with_optional_target("window-close", &target.window_id))
+        acted(actions::CompositorAction::on_window(
+            "window-close",
+            target.window_id.as_deref(),
+        ))
     }
 
     #[tool(
@@ -932,7 +986,10 @@ impl UmbrielServer {
         &self,
         Parameters(target): Parameters<WindowTarget>,
     ) -> Result<String, ErrorData> {
-        acted(with_optional_target("window-kill", &target.window_id))
+        acted(actions::CompositorAction::on_window(
+            "window-kill",
+            target.window_id.as_deref(),
+        ))
     }
 
     #[tool(description = "Move the focused window to a workspace, optionally scoped to an output.")]
@@ -940,16 +997,16 @@ impl UmbrielServer {
         &self,
         Parameters(target): Parameters<WorkspaceTarget>,
     ) -> Result<String, ErrorData> {
-        let selector = match &target.output {
-            Some(output) => format!("{}/{}", target.workspace, output),
-            None => target.workspace.clone(),
-        };
-        acted(format!("window-move-to-workspace:{selector}"))
+        acted(actions::CompositorAction::on_workspace(
+            "window-move-to-workspace",
+            &target.workspace,
+            target.output.as_deref(),
+        ))
     }
 
     #[tool(description = "Toggle fullscreen for the focused window.")]
     fn toggle_fullscreen(&self) -> Result<String, ErrorData> {
-        acted("window-toggle-fullscreen".to_string())
+        acted(actions::CompositorAction::plain("window-toggle-fullscreen"))
     }
 
     #[tool(description = "Float or tile a window; acts on the focused window when no id is given.")]
@@ -957,9 +1014,9 @@ impl UmbrielServer {
         &self,
         Parameters(target): Parameters<WindowTarget>,
     ) -> Result<String, ErrorData> {
-        acted(with_optional_target(
+        acted(actions::CompositorAction::on_window(
             "window-toggle-floating",
-            &target.window_id,
+            target.window_id.as_deref(),
         ))
     }
 
@@ -982,22 +1039,22 @@ impl UmbrielServer {
                 ));
             }
         };
-        acted(format!("{verb}:{}", request.delta))
+        acted(actions::CompositorAction::by_delta(verb, request.delta))
     }
 
     #[tool(
-        description = "Set the active workspace layout: scrolling, dwindle, master or floating."
+        description = "Set the active workspace layout: scrolling, dwindle, master or stacking (older Umbriel calls stacking floating; either name works)."
     )]
     fn set_workspace_layout(
         &self,
         Parameters(request): Parameters<LayoutRequest>,
     ) -> Result<String, ErrorData> {
-        acted(format!("workspace-set-layout:{}", request.mode))
+        acted(actions::CompositorAction::set_layout(&request.mode))
     }
 
     #[tool(description = "Toggle the workspace overview.")]
     fn toggle_overview(&self) -> Result<String, ErrorData> {
-        acted("overview-toggle".to_string())
+        acted(actions::CompositorAction::plain("overview-toggle"))
     }
 
     #[tool(description = "Launch a command through the compositor with an activation token.")]
@@ -1005,15 +1062,18 @@ impl UmbrielServer {
         &self,
         Parameters(request): Parameters<SpawnRequest>,
     ) -> Result<String, ErrorData> {
-        acted(format!("spawn:{}", request.command))
+        acted(actions::CompositorAction::spawn(&request.command))
     }
 
-    #[tool(description = "Run any raw umbriel action, for anything the other tools do not cover.")]
+    #[tool(
+        description = "Run any Umbriel action, for anything the other tools do not cover. Use list_actions for the names and argument syntax."
+    )]
     fn run_action(&self, Parameters(request): Parameters<RawAction>) -> Result<String, ErrorData> {
         self.profile
             .permit_action("run_action", &request.action)
             .map_err(refused)?;
-        acted(request.action)
+        ipc::perform_text(&request.action).map_err(failed)?;
+        Ok(format!("ok: {}", request.action.trim()))
     }
 
     #[tool(
@@ -1208,6 +1268,10 @@ impl UmbrielServer {
             )
         })?;
         let (x, y) = shot.screen_point(best.center_x, best.center_y);
+        if let screen::Area::Window(id) = &area {
+            let placement = ipc::window_placement(id).map_err(failed)?;
+            refuse_unreachable_point(id, &placement, x, y)?;
+        }
         move_pointer_to(x as i32, y as i32)?;
         input::click("left", false).map_err(failed)?;
         Ok(format!(
@@ -1400,7 +1464,12 @@ impl UmbrielServer {
         match config_edit::prepare_set_keybind(&request.chord, &request.action, request.repeat)
             .map_err(failed)?
         {
-            Some(change) => self.approve_and_write(&peer, change).await,
+            Some(change) => {
+                let starts_a_program = profile::is_spawn_action(&request.action)
+                    .then_some("it binds a key to start a program");
+                self.approve_and_write(&peer, change.asking_every_time_because(starts_a_program))
+                    .await
+            }
             None => Ok(format!(
                 "{} is already bound to {}; nothing changed",
                 request.chord.trim(),
@@ -1433,7 +1502,11 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         self.permit_setting("set_option", &request.key, Some(&request.value))?;
         match setting::prepare_set_option(&request.key, &request.value).map_err(failed)? {
-            Some(change) => self.approve_and_write(&peer, change).await,
+            Some(change) => {
+                let reason = setting_that_always_asks(&request.key, &request.value);
+                self.approve_and_write(&peer, change.asking_every_time_because(reason))
+                    .await
+            }
             None => Ok(format!(
                 "{} already has that value; nothing changed",
                 request.key.trim()
@@ -1466,8 +1539,12 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         let fields = rules::fields_for(&request.list, &request.rule).map_err(failed)?;
         self.permit_rule("add_rule", &request.list, &fields)?;
+        let reason = rules::needs_full_profile(request.list.trim(), &fields);
         match rules::prepare_add(request.list.trim(), fields).map_err(failed)? {
-            Some(change) => self.approve_and_write(&peer, change).await,
+            Some(change) => {
+                self.approve_and_write(&peer, change.asking_every_time_because(reason))
+                    .await
+            }
             None => Ok("that rule would not change the config; nothing changed".to_owned()),
         }
     }
@@ -1483,10 +1560,14 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         let fields = rules::fields_for(&request.list, &request.rule).map_err(failed)?;
         self.permit_rule("replace_rule", &request.list, &fields)?;
+        let reason = rules::needs_full_profile(request.list.trim(), &fields);
         match rules::prepare_replace(request.list.trim(), request.position, fields)
             .map_err(failed)?
         {
-            Some(change) => self.approve_and_write(&peer, change).await,
+            Some(change) => {
+                self.approve_and_write(&peer, change.asking_every_time_because(reason))
+                    .await
+            }
             None => Ok("the new rule is identical to the old one; nothing changed".to_owned()),
         }
     }
@@ -1520,6 +1601,9 @@ impl UmbrielServer {
         let keep_backup = request
             .backup
             .unwrap_or_else(approval::keep_backup_unless_told_otherwise);
+        if request.allow_rest_of_session == Some(true) {
+            self.pending_changes.allow_rest_of_session(keep_backup);
+        }
         config_edit::commit(
             &change,
             config_edit::BackupPolicy {

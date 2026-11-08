@@ -1,3 +1,4 @@
+use crate::placement::OnScreen;
 use serde_json::{Map, Value};
 
 const BRIEF_WINDOW_FIELDS: &[&str] = &[
@@ -35,11 +36,24 @@ fn keep_fields(entry: &Value, fields: &[&str]) -> Map<String, Value> {
         .collect()
 }
 
-pub fn brief_window(window: &Value, keyboard_focus_id: Option<&str>) -> Value {
+fn on_screen_word(on_screen: OnScreen) -> &'static str {
+    match on_screen {
+        OnScreen::FullyInView => "fully",
+        OnScreen::PartlyInView => "partly",
+        OnScreen::ScrolledOutOfView => "scrolled_out_of_view",
+        OnScreen::Hidden => "hidden",
+    }
+}
+
+pub fn brief_window(window: &Value, keyboard_focus_id: Option<&str>, outputs: &[Value]) -> Value {
     if !window.is_object() {
         return window.clone();
     }
     let mut brief = keep_fields(window, BRIEF_WINDOW_FIELDS);
+    brief.insert(
+        "on_screen".to_owned(),
+        Value::String(on_screen_word(crate::placement::on_screen(window, outputs)).to_owned()),
+    );
     let has_keyboard_focus = keyboard_focus_id.is_some()
         && window.get("id").and_then(Value::as_str) == keyboard_focus_id;
     brief.insert(
@@ -94,14 +108,17 @@ mod tests {
     fn a_brief_window_keeps_only_what_identifies_and_places_it() {
         let window = json!({"id": "a", "title": "t", "x": 1, "pid": 9, "focused": true});
         assert_eq!(
-            brief_window(&window, Some("a")),
-            json!({"id": "a", "title": "t", "x": 1, "has_keyboard_focus": true})
+            brief_window(&window, Some("a"), &[]),
+            json!({"id": "a", "title": "t", "x": 1, "has_keyboard_focus": true, "on_screen": "fully"})
         );
         assert_eq!(
-            brief_window(&window, Some("b"))["has_keyboard_focus"],
+            brief_window(&window, Some("b"), &[])["has_keyboard_focus"],
             false
         );
-        assert_eq!(brief_window(&window, None)["has_keyboard_focus"], false);
+        assert_eq!(
+            brief_window(&window, None, &[])["has_keyboard_focus"],
+            false
+        );
     }
 
     #[test]
@@ -118,6 +135,6 @@ mod tests {
 
     #[test]
     fn no_focused_window_stays_as_umbriel_reported_it() {
-        assert_eq!(brief_window(&json!(null), None), json!(null));
+        assert_eq!(brief_window(&json!(null), None, &[]), json!(null));
     }
 }
