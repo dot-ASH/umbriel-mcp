@@ -215,7 +215,7 @@ fn profile_defaults_to_full() {
     let fake = FakeUmbriel::start(canned_replies());
     let mut server = McpProcess::start(&fake.path);
 
-    let response = server.call_tool("launch_app", json!({"command":"kitty"}));
+    let response = call_and_confirm_launch(&mut server, "launch_app", json!({"command":"kitty"}));
 
     assert_not_refused_by_profile(&response);
     assert_eq!(compositor_actions(&fake), vec!["spawn:kitty"]);
@@ -226,8 +226,8 @@ fn full_profile_permits_launching_and_spawn_actions() {
     let fake = FakeUmbriel::start(canned_replies());
     let mut server = McpProcess::start_with_profile(&fake.path, "full");
 
-    server.call_tool("launch_app", json!({"command":"kitty"}));
-    server.call_tool("run_action", json!({"action":"spawn:foot"}));
+    call_and_confirm_launch(&mut server, "launch_app", json!({"command":"kitty"}));
+    call_and_confirm_launch(&mut server, "run_action", json!({"action":"spawn:foot"}));
     server.call_tool("run_action", json!({"action":"overview-toggle"}));
 
     assert_eq!(
@@ -1507,6 +1507,7 @@ fn every_config_write_tool_is_marked_destructive() {
         "add_rule",
         "replace_rule",
         "remove_rule",
+        "confirm_launch",
     ] {
         let tool = tools["result"]["tools"]
             .as_array()
@@ -2692,6 +2693,10 @@ fn wait_for_change_compares_with_the_previous_capture_and_returns_the_settled_sc
     assert!(note.contains("changed after"), "{note}");
     assert!(note.contains("settled"), "{note}");
     assert_eq!(image_count(&response), 1, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["change"]["settled"], true,
+        "{response}"
+    );
 }
 
 #[test]
@@ -3002,7 +3007,8 @@ fn newer_umbriel_gets_typed_actions_from_the_dedicated_tools() {
         ("launch_app", json!({"command": "kitty --hold"})),
         ("toggle_overview", json!({})),
     ] {
-        server.call_text(tool, arguments);
+        let response = call_and_confirm_launch(&mut server, tool, arguments);
+        assert!(response.get("error").is_none(), "{tool}: {response}");
     }
 
     assert_eq!(
@@ -3039,7 +3045,9 @@ fn on_newer_umbriel_run_action_takes_either_syntax_through_the_umbriel_command()
         "workspace-switch:2/DP-1",
         "spawn sh -c 'echo hi'",
     ] {
-        server.call_text("run_action", json!({"action": action}));
+        let response =
+            call_and_confirm_launch(&mut server, "run_action", json!({"action": action}));
+        assert!(response.get("error").is_none(), "{action}: {response}");
     }
 
     assert_eq!(
@@ -3262,4 +3270,253 @@ fn the_brief_listing_says_how_much_of_each_window_is_on_screen_and_filters_by_ap
     assert_eq!(firefox[0]["id"], "browser");
     assert_eq!(by_pid.as_array().unwrap().len(), 1);
     assert_eq!(by_pid[0]["id"], "notes");
+}
+
+fn structured(response: &Value) -> Value {
+    response["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn a_capture_also_returns_its_facts_as_structured_data() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    let response = server.call_tool(
+        "screenshot",
+        json!({"region": {"x": 100, "y": 200, "width": 300, "height": 150}}),
+    );
+
+    let facts = structured(&response);
+    assert_eq!(facts["area"]["kind"], "region", "{facts}");
+    assert_eq!(
+        facts["covers"],
+        json!({"x": 100, "y": 200, "width": 300, "height": 150}),
+        "{facts}"
+    );
+    assert_eq!(facts["image_width"], 1024, "{facts}");
+    assert!(
+        facts["captured_at_unix_ms"].as_u64().unwrap() > 1_700_000_000_000,
+        "{facts}"
+    );
+    assert!(facts.get("saved_to").is_none(), "{facts}");
+}
+
+#[test]
+fn save_to_writes_the_full_resolution_png_and_reports_where() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+    let folder = support::scratch_directory("saved");
+    let target = folder.join("shots/editor.png");
+
+    let response = server.call_tool(
+        "screenshot",
+        json!({"window_id": "shown", "save_to": target.to_str().unwrap()}),
+    );
+
+    assert_eq!(
+        structured(&response)["saved_to"],
+        target.to_str().unwrap(),
+        "{response}"
+    );
+    let saved = image::open(&target).expect("a readable PNG");
+    assert_eq!((saved.width(), saved.height()), (3840, 1080));
+    assert!(text_content(&response).contains("Saved"), "{response}");
+}
+
+#[test]
+fn save_to_refuses_paths_that_could_overwrite_other_files() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+    let folder = support::scratch_directory("saved");
+    let config = folder.join("settings.png");
+    std::fs::write(&config, "not an image").unwrap();
+
+    for (path, expected) in [
+        ("relative/shot.png", "absolute"),
+        (folder.join("shot.txt").to_str().unwrap(), ".png"),
+        (config.to_str().unwrap(), "not a PNG"),
+    ] {
+        let response = server.call_tool("screenshot", json!({"save_to": path}));
+        let message = error_message(&response);
+        assert!(message.contains(expected), "{path}: {message}");
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "not an image");
+}
+
+#[test]
+fn text_matches_are_also_returned_as_structured_data() {
+    let (_fake, mut server, _record) = start_playing(&[fixture_frame()]);
+
+    let response = server.call_tool("find_text_on_screen", json!({"target": "Cancel"}));
+
+    let matches = structured(&response)["matches"].clone();
+    assert!(!matches.as_array().unwrap().is_empty(), "{response}");
+    assert_eq!(matches[0]["text"], "Cancel");
+    assert!(matches[0]["x"].as_i64().is_some() && matches[0]["y"].as_i64().is_some());
+}
+
+#[test]
+fn scrolling_and_dragging_inside_a_window_use_coordinates_relative_to_it() {
+    let (_fake, mut server) = start_input_test();
+
+    let scrolled = server.call_tool(
+        "mouse_scroll",
+        json!({"window_id": "zen-1", "x": 10, "y": 20, "direction": "down"}),
+    );
+    let dragged = server.call_tool(
+        "mouse_drag",
+        json!({"window_id": "zen-1", "from_x": 10, "from_y": 20, "to_x": 110, "to_y": 20}),
+    );
+    let hidden = server.call_tool(
+        "mouse_drag",
+        json!({"window_id": "chat", "from_x": 1, "from_y": 1, "to_x": 2, "to_y": 2}),
+    );
+
+    assert!(error_message(&scrolled).contains("(17, 55)"), "{scrolled}");
+    assert!(error_message(&dragged).contains("(17, 55)"), "{dragged}");
+    assert!(error_message(&hidden).contains("not on screen"), "{hidden}");
+}
+
+fn launch_code(response: &Value) -> Option<String> {
+    let text = response["result"]["content"][0]["text"].as_str()?;
+    let after = text.split("confirmation \"").nth(1)?;
+    Some(after.split('"').next()?.to_owned())
+}
+
+fn call_and_confirm_launch(server: &mut McpProcess, tool: &str, arguments: Value) -> Value {
+    let previewed = server.call_tool(tool, arguments);
+    match launch_code(&previewed) {
+        Some(code) => server.call_tool("confirm_launch", json!({"confirmation": code})),
+        None => previewed,
+    }
+}
+
+fn start_launcher(approval_reply: Option<Value>) -> (FakeUmbriel, McpProcess) {
+    let fake = FakeUmbriel::start(canned_replies());
+    let capabilities = if approval_reply.is_some() {
+        json!({"elicitation": {}})
+    } else {
+        json!({})
+    };
+    let server = McpProcess::start_as_client(&fake.path, &[], &[], capabilities, approval_reply);
+    (fake, server)
+}
+
+#[test]
+fn starting_a_program_asks_first_and_shows_the_command() {
+    let start = json!({"action": "accept", "content": {"start": true}});
+    let (fake, mut server) = start_launcher(Some(start));
+
+    let launched = server.call_tool("launch_app", json!({"command": "kitty --hold"}));
+
+    assert_eq!(server.approval_questions.len(), 1);
+    assert!(
+        server.approval_questions[0].contains("kitty --hold"),
+        "{:?}",
+        server.approval_questions
+    );
+    let allow = &server.approval_forms[0]["properties"]["allow_rest_of_session"];
+    assert_eq!(allow["default"], false, "{:?}", server.approval_forms);
+    assert!(text_content(&launched).contains("Started"), "{launched}");
+    assert_eq!(compositor_actions(&fake), vec!["spawn:kitty --hold"]);
+}
+
+#[test]
+fn a_declined_program_is_not_started() {
+    for reply in [
+        json!({"action": "decline"}),
+        json!({"action": "accept", "content": {"start": false}}),
+    ] {
+        let (fake, mut server) = start_launcher(Some(reply.clone()));
+
+        let response = server.call_tool("run_action", json!({"action": "spawn foot"}));
+
+        assert!(
+            text_content(&response).contains("not started"),
+            "{reply}: {response}"
+        );
+        assert!(compositor_actions(&fake).is_empty(), "{reply}");
+    }
+}
+
+#[test]
+fn allowing_programs_for_the_session_stops_the_questions_for_launches_only() {
+    let allow =
+        json!({"action": "accept", "content": {"start": true, "allow_rest_of_session": true}});
+    let (fake, mut server) = start_launcher(Some(allow));
+
+    server.call_tool("launch_app", json!({"command": "kitty"}));
+    let second = server.call_tool("run_action", json!({"action": "spawn foot"}));
+    server.call_tool("run_action", json!({"action": "overview-toggle"}));
+
+    assert_eq!(
+        server.approval_questions.len(),
+        1,
+        "{:?}",
+        server.approval_questions
+    );
+    assert!(text_content(&second).contains("without asking"), "{second}");
+    assert_eq!(
+        compositor_actions(&fake),
+        vec!["spawn:kitty", "spawn:foot", "overview-toggle"]
+    );
+}
+
+#[test]
+fn ordinary_actions_never_ask() {
+    let start = json!({"action": "accept", "content": {"start": true}});
+    let (fake, mut server) = start_launcher(Some(start));
+
+    server.call_text("run_action", json!({"action": "overview-toggle"}));
+    server.call_text("switch_workspace", json!({"workspace": "2"}));
+
+    assert!(server.approval_questions.is_empty());
+    assert_eq!(compositor_actions(&fake).len(), 2);
+}
+
+#[test]
+fn without_a_dialog_a_program_starts_only_after_its_code_is_confirmed() {
+    let (fake, mut server) = start_launcher(None);
+
+    let held = server.call_tool("launch_app", json!({"command": "kitty"}));
+    assert!(
+        compositor_actions(&fake).is_empty(),
+        "nothing starts before confirmation"
+    );
+    let code = launch_code(&held).expect("a confirmation code");
+    assert!(
+        text_content(&held).contains("allow_rest_of_session"),
+        "{held}"
+    );
+
+    server.call_text(
+        "confirm_launch",
+        json!({"confirmation": code, "allow_rest_of_session": true}),
+    );
+    let later = server.call_tool("launch_app", json!({"command": "foot"}));
+    let reused = server.call_tool("confirm_launch", json!({"confirmation": code}));
+
+    assert!(launch_code(&later).is_none(), "{later}");
+    assert_eq!(compositor_actions(&fake), vec!["spawn:kitty", "spawn:foot"]);
+    assert!(
+        error_message(&reused).contains("no program is waiting"),
+        "{reused}"
+    );
+}
+
+#[test]
+fn allowing_config_changes_does_not_allow_starting_programs() {
+    let home = home_with_config(KEYBIND_CONFIG);
+    let approve = json!({"action": "accept", "content": {
+        "apply": true, "start": true, "allow_rest_of_session": true
+    }});
+    let (_fake, mut server) = start_editor(&home, "full", two_outputs(), Some(approve));
+
+    server.call_tool("set_option", json!({"key":"layout.gap","value":12}));
+    server.call_tool("launch_app", json!({"command": "kitty"}));
+    server.call_tool("launch_app", json!({"command": "foot"}));
+
+    assert_eq!(
+        server.approval_questions.len(),
+        2,
+        "{:?}",
+        server.approval_questions
+    );
 }

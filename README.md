@@ -112,7 +112,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.4.2
+   tag=v0.4.3
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -229,7 +229,7 @@ external programs are needed only for the screen tools:
 
 | Tool | Used for | Arch | Debian/Ubuntu | Fedora |
 |---|---|---|---|---|
-| `grim` | `screenshot`, OCR tools | `grim` | `grim` | `grim` |
+| `grim` | screenshots of the screen, a monitor or a region, and OCR on them (windows are captured without it) | `grim` | `grim` | `grim` |
 | `tesseract` | `screenshot_with_ocr`, `find_text_on_screen`, `click_text` | `tesseract` | `tesseract-ocr` | `tesseract` |
 | English OCR data | same | `tesseract-data-eng` | `tesseract-ocr-eng` | `tesseract-langpack-eng` |
 | `wf-recorder` | `start_recording`, `stop_recording` | `wf-recorder` | `wf-recorder` | `wf-recorder` |
@@ -295,12 +295,18 @@ call the profile does not allow returns an error that names the profile.
 
 | Profile | Allows |
 |---|---|
-| `full` (default) | everything, including `launch_app` and spawn actions |
+| `full` (default) | everything, including `launch_app` and spawn actions, which ask you first |
 | `no-exec` | everything except starting programs: `launch_app` and any `run_action` that spawns are refused |
 | `read-only` | queries, screenshots, OCR, and reading the clipboard |
 
 `no-exec` stops the server from starting programs; it is not a sandbox. An agent that can
 type into a focused terminal can still run commands through the input tools.
+
+In `full`, starting a program (`launch_app`, or `run_action` with `spawn`) asks you first and
+shows the exact command, the same way config changes do: a dialog where the client supports
+one, otherwise a one-time code the model passes to `confirm_launch` after you agree. The
+question offers to stop asking about programs for the rest of the session; that permission is
+separate from the one for config changes, and a new session asks again.
 
 ## Tools
 
@@ -321,9 +327,12 @@ where it was meant to go:
 
 - `type_text` and `key_press` take a `window_id`: if that window does not have keyboard focus,
   nothing is typed and the error names the window that does.
-- `mouse_click` and `mouse_move` take a `window_id` with `x` and `y` counted from that window's
-  top-left corner. A window that is not on screen, or a point outside it, is refused.
-- After typing, pressing or clicking, the result says which window has keyboard focus.
+- `mouse_click`, `mouse_move`, `mouse_scroll` and `mouse_drag` take a `window_id` with `x` and
+  `y` counted from that window's top-left corner. A window that is not on screen, a point
+  outside it, a point scrolled out of view, or a point covered by a menu, overlay or floating
+  window is refused, so the pointer never lands on something else.
+- After typing, pressing, clicking or dragging, the result says which window has keyboard
+  focus.
 
 **About Umbriel itself** — `umbriel_info` (version, keyboard layouts, submap, color and
 tearing state), `list_actions` (every action `run_action` and keybinds accept, filterable),
@@ -394,13 +403,23 @@ waits for you.
 **Screen and clipboard** — `screenshot`, `screenshot_with_ocr`, `find_text_on_screen`,
 `click_text`, `wait_for_text`, `wait_for_change`, `clipboard_read`, `clipboard_write`.
 
-- With a `window_id`, captures and text search cover only that window, even on a hidden
-  workspace, without switching to it (needs `grim` 1.5 or newer; older `grim` can only capture
-  windows that are on screen). This leaves your other windows out of the picture.
+- With a `window_id`, captures and text search cover only that window, taken straight from
+  Umbriel: even on a hidden workspace, scrolled out of view or under another window, without
+  switching to it, and without `grim`. This leaves your other windows out of the picture. If
+  Umbriel cannot provide it, `grim` 1.5 or newer is used instead; an older `grim` can only
+  capture the screen area of a window that is fully in view and uncovered, and says so.
 - With a `region` (`x`, `y`, `width`, `height` in screen coordinates), they cover only that
   rectangle, at full resolution, to zoom in on a detail.
 - Every capture says when it was taken, and notes when a window's title changed since its last
   capture, which usually means it shows a different page or someone else is using it.
+- Besides the image and its description, captures, text searches and waits return the same
+  facts as structured data: the area, the screen rectangle covered, the pixels captured, the
+  conversion from image to screen coordinates, the time, how it was captured, and any text
+  matches with their screen coordinates.
+- `save_to` also saves the full-resolution capture as a PNG at an absolute path (or `~/...`).
+  It must end in `.png`, and an existing file is replaced only if it is already a PNG.
+- On a scaled monitor, image coordinates are converted to the screen's logical coordinates,
+  which is what clicks use.
 - `wait_for_text` waits until text appears. `wait_for_change` waits until a window, monitor or
   region differs from your previous capture of it and then stops changing, and returns the
   settled picture; if nothing changed, it says so. Both give up after 10 seconds by default

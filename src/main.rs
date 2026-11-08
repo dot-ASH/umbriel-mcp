@@ -13,11 +13,13 @@ mod profile;
 mod recording;
 mod register;
 mod rules;
+mod saving;
 mod screen;
 mod setting;
 mod uninstall;
 mod update;
 mod watching;
+mod window_capture;
 
 use base64::prelude::{BASE64_STANDARD, Engine};
 use capture_target::{CaptureTarget, Purpose};
@@ -245,6 +247,15 @@ fn setting_that_always_asks(key: &str, value: &serde_json::Value) -> Option<&'st
     }
 }
 
+fn start_program(launch: &approval::Launch) -> Result<(), ErrorData> {
+    match launch {
+        approval::Launch::App(command) => {
+            ipc::perform(&actions::CompositorAction::spawn(command)).map_err(failed)
+        }
+        approval::Launch::Action(action) => ipc::perform_text(action).map_err(failed),
+    }
+}
+
 fn acted(action: actions::CompositorAction) -> Result<String, ErrorData> {
     ipc::perform(&action).map_err(failed)?;
     Ok(format!("ok: {}", action.summary()))
@@ -357,6 +368,12 @@ struct ScrollRequest {
     direction: Option<String>,
     /// Number of wheel steps
     amount: Option<i32>,
+    /// Scroll at this x instead of where the pointer is: absolute, or relative to window_id
+    x: Option<i32>,
+    /// Scroll at this y instead of where the pointer is: absolute, or relative to window_id
+    y: Option<i32>,
+    /// Scroll inside this window at x, y relative to its top-left; refused if it is not on screen
+    window_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -367,6 +384,8 @@ struct DragRequest {
     to_y: i32,
     /// left, right, middle or side
     button: Option<String>,
+    /// Make both points relative to this window's top-left; refused if it is not on screen
+    window_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -424,6 +443,87 @@ fn capture_description(shot: &screen::Capture, notes: &[String]) -> String {
         .join("\n")
 }
 
+fn area_facts(area: &screen::Area) -> serde_json::Value {
+    match area {
+        screen::Area::WholeScreen => serde_json::json!({"kind": "screen"}),
+        screen::Area::Output(name) => serde_json::json!({"kind": "output", "output": name}),
+        screen::Area::Window(id) => serde_json::json!({"kind": "window", "window_id": id}),
+        screen::Area::Region(region) => serde_json::json!({
+            "kind": "region", "x": region.x, "y": region.y,
+            "width": region.width, "height": region.height
+        }),
+    }
+}
+
+fn capture_facts(
+    area: &screen::Area,
+    shot: &screen::Capture,
+    notes: &[String],
+    saved_to: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let unix_ms = shot
+        .captured_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut facts = serde_json::json!({
+        "area": area_facts(area),
+        "image_width": shot.encoded_width,
+        "image_height": shot.encoded_height,
+        "covers": {
+            "x": shot.origin_x, "y": shot.origin_y,
+            "width": shot.screen_width, "height": shot.screen_height
+        },
+        "captured_pixels": {"width": shot.native_width, "height": shot.native_height},
+        "screen_units_per_image_pixel": {
+            "x": shot.screen_width as f64 / shot.encoded_width.max(1) as f64,
+            "y": shot.screen_height as f64 / shot.encoded_height.max(1) as f64
+        },
+        "captured_at": screen::clock_time(shot.captured_at),
+        "captured_at_unix_ms": unix_ms,
+        "shown_on_screen": shot.shown_on_screen,
+        "captured_by": shot.captured_by,
+        "notes": shot.notes.iter().chain(notes).collect::<Vec<_>>(),
+    });
+    if let Some(path) = saved_to {
+        facts["saved_to"] = serde_json::json!(path.display().to_string());
+    }
+    facts
+}
+
+fn match_facts(shot: &screen::Capture, matches: &[screen::TextMatch]) -> serde_json::Value {
+    serde_json::Value::Array(
+        matches
+            .iter()
+            .map(|hit| {
+                let (x, y) = shot.screen_point(hit.center_x, hit.center_y);
+                serde_json::json!({"text": hit.text, "confidence": hit.confidence, "x": x, "y": y})
+            })
+            .collect(),
+    )
+}
+
+fn with_facts(mut result: CallToolResult, facts: serde_json::Value) -> CallToolResult {
+    result.structured_content = Some(facts);
+    result
+}
+
+fn saved_where(
+    save_to: Option<&str>,
+    shot: &screen::Capture,
+) -> Result<Option<std::path::PathBuf>, ErrorData> {
+    save_to
+        .map(|path| saving::save_png(path, &shot.native_png))
+        .transpose()
+        .map_err(|error| ErrorData::invalid_params(format!("{error:#}"), None))
+}
+
+fn saved_note(saved_to: Option<&std::path::Path>) -> String {
+    saved_to
+        .map(|path| format!("\nSaved the full-resolution capture to {}.", path.display()))
+        .unwrap_or_default()
+}
+
 fn matches_described(shot: &screen::Capture, matches: &[screen::TextMatch]) -> String {
     let mut lines: Vec<String> = matches
         .iter()
@@ -454,6 +554,9 @@ struct CaptureRequest {
     window_id: Option<String>,
     /// Capture only this rectangle of the screen, to zoom in on a detail at full resolution
     region: Option<RegionRequest>,
+    /// Also save the full-resolution capture as a PNG at this absolute path (or ~/...); an
+    /// existing file is replaced only if it is a PNG
+    save_to: Option<String>,
     /// Downscale so the image is at most this wide
     max_width: Option<u32>,
     /// True only when the user asked for this screenshot without saying what to capture: they
@@ -603,6 +706,15 @@ struct ConfirmationCode {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LaunchConfirmation {
+    /// Confirmation code returned by launch_app or run_action
+    confirmation: String,
+    /// True only if the user explicitly said to stop asking about programs for the rest of this
+    /// session; never set it on your own
+    allow_rest_of_session: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct KeybindChord {
     /// Key chord to unbind, such as "Mod+F"
     chord: String,
@@ -626,6 +738,7 @@ struct UmbrielServer {
     pending_changes: Arc<approval::PendingChanges>,
     recorder: Arc<recording::Recorder>,
     watcher: Arc<watching::Watcher>,
+    pending_launches: Arc<approval::PendingLaunches>,
 }
 
 enum Chosen {
@@ -688,6 +801,7 @@ impl UmbrielServer {
             pending_changes: Arc::default(),
             recorder: Arc::default(),
             watcher: Arc::default(),
+            pending_launches: Arc::default(),
         }
     }
 
@@ -802,6 +916,29 @@ impl UmbrielServer {
                 self.profile
             ))),
             _ => Ok(()),
+        }
+    }
+
+    async fn launch_after_asking(
+        &self,
+        peer: &Peer<RoleServer>,
+        launch: approval::Launch,
+    ) -> Result<String, ErrorData> {
+        match approval::ask_before_launching(peer, &self.pending_launches, &launch)
+            .await
+            .map_err(failed)?
+        {
+            approval::LaunchDecision::Start { asked } => {
+                start_program(&launch)?;
+                let how = if asked {
+                    ""
+                } else {
+                    " without asking, because the user allowed starting programs for the rest of \
+                     this session"
+                };
+                Ok(format!("Started {:?}{how}.", launch.program()))
+            }
+            approval::LaunchDecision::NotStarted(message) => Ok(message),
         }
     }
 
@@ -1057,23 +1194,56 @@ impl UmbrielServer {
         acted(actions::CompositorAction::plain("overview-toggle"))
     }
 
-    #[tool(description = "Launch a command through the compositor with an activation token.")]
-    fn launch_app(
+    #[tool(
+        description = "Launch a command through the compositor with an activation token. The user is asked first unless they allowed starting programs for the rest of this session.",
+        annotations(destructive_hint = true)
+    )]
+    async fn launch_app(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(request): Parameters<SpawnRequest>,
     ) -> Result<String, ErrorData> {
-        acted(actions::CompositorAction::spawn(&request.command))
+        self.launch_after_asking(&peer, approval::Launch::App(request.command))
+            .await
     }
 
     #[tool(
-        description = "Run any Umbriel action, for anything the other tools do not cover. Use list_actions for the names and argument syntax."
+        description = "Run any Umbriel action, for anything the other tools do not cover. Use list_actions for the names and argument syntax. Actions that start a program (spawn) ask the user first, like launch_app."
     )]
-    fn run_action(&self, Parameters(request): Parameters<RawAction>) -> Result<String, ErrorData> {
+    async fn run_action(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(request): Parameters<RawAction>,
+    ) -> Result<String, ErrorData> {
         self.profile
             .permit_action("run_action", &request.action)
             .map_err(refused)?;
+        if profile::is_spawn_action(&request.action) {
+            return self
+                .launch_after_asking(&peer, approval::Launch::Action(request.action))
+                .await;
+        }
         ipc::perform_text(&request.action).map_err(failed)?;
         Ok(format!("ok: {}", request.action.trim()))
+    }
+
+    #[tool(
+        description = "Start a program the user has explicitly agreed to, using the confirmation code launch_app or run_action returned. Only call this after asking the user and getting their yes; never on their behalf.",
+        annotations(destructive_hint = true)
+    )]
+    fn confirm_launch(
+        &self,
+        Parameters(request): Parameters<LaunchConfirmation>,
+    ) -> Result<String, ErrorData> {
+        let launch = self
+            .pending_launches
+            .take(&request.confirmation)
+            .map_err(failed)?;
+        if request.allow_rest_of_session == Some(true) {
+            self.pending_launches.allow_rest_of_session();
+        }
+        start_program(&launch)?;
+        Ok(format!("Started {:?}.", launch.program()))
     }
 
     #[tool(
@@ -1117,6 +1287,9 @@ impl UmbrielServer {
     ) -> Result<String, ErrorData> {
         let direction = request.direction.unwrap_or_else(|| "down".to_string());
         let amount = request.amount.unwrap_or(3);
+        if let Some((x, y)) = pointer_target(request.window_id.as_deref(), request.x, request.y)? {
+            move_pointer_to(x, y)?;
+        }
         input::scroll(&direction, amount).map_err(failed)?;
         Ok(format!("scrolled {direction} by {amount}"))
     }
@@ -1127,15 +1300,29 @@ impl UmbrielServer {
         Parameters(request): Parameters<DragRequest>,
     ) -> Result<String, ErrorData> {
         let button = request.button.unwrap_or_else(|| "left".to_string());
-        input::drag(
-            (request.from_x, request.from_y),
-            (request.to_x, request.to_y),
-            &button,
-        )
-        .map_err(failed)?;
+        let (from, to) = match &request.window_id {
+            Some(id) => (
+                point_in_window(id, request.from_x, request.from_y)?,
+                point_in_window(id, request.to_x, request.to_y)?,
+            ),
+            None => (
+                (request.from_x, request.from_y),
+                (request.to_x, request.to_y),
+            ),
+        };
+        input::drag(from, to, &button).map_err(|error| {
+            failed(error.context(format!(
+                "could not drag from screen ({}, {}) to ({}, {})",
+                from.0, from.1, to.0, to.1
+            )))
+        })?;
         Ok(format!(
-            "dragged {button} from {},{} to {},{}",
-            request.from_x, request.from_y, request.to_x, request.to_y
+            "dragged {button} from {},{} to {},{}. {}",
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            focus_report()
         ))
     }
 
@@ -1179,13 +1366,22 @@ impl UmbrielServer {
         };
         let max_width = request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH);
         let (shot, notes) = self.watcher.capture(&area, max_width).map_err(failed)?;
-        Ok(CallToolResult::success(vec![
+        let saved_to = saved_where(request.save_to.as_deref(), &shot)?;
+        let result = CallToolResult::success(vec![
             ContentBlock::image(
                 BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
                 "image/jpeg",
             ),
-            ContentBlock::text(capture_description(&shot, &notes)),
-        ]))
+            ContentBlock::text(format!(
+                "{}{}",
+                capture_description(&shot, &notes),
+                saved_note(saved_to.as_deref())
+            )),
+        ]);
+        Ok(with_facts(
+            result,
+            capture_facts(&area, &shot, &notes, saved_to.as_deref()),
+        ))
     }
 
     #[tool(
@@ -1203,16 +1399,21 @@ impl UmbrielServer {
         let max_width = request.max_width.unwrap_or(screen::DEFAULT_MAX_WIDTH);
         let (shot, notes) = self.watcher.capture(&area, max_width).map_err(failed)?;
         let recognised = screen::read_text(&shot.native_png).map_err(failed)?;
-        Ok(CallToolResult::success(vec![
+        let saved_to = saved_where(request.save_to.as_deref(), &shot)?;
+        let result = CallToolResult::success(vec![
             ContentBlock::image(
                 BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
                 "image/jpeg",
             ),
             ContentBlock::text(format!(
-                "{}\n\nOCR text:\n{recognised}",
-                capture_description(&shot, &notes)
+                "{}{}\n\nOCR text:\n{recognised}",
+                capture_description(&shot, &notes),
+                saved_note(saved_to.as_deref())
             )),
-        ]))
+        ]);
+        let mut facts = capture_facts(&area, &shot, &notes, saved_to.as_deref());
+        facts["text"] = serde_json::json!(recognised);
+        Ok(with_facts(result, facts))
     }
 
     #[tool(
@@ -1221,21 +1422,22 @@ impl UmbrielServer {
     fn find_text_on_screen(
         &self,
         Parameters(request): Parameters<TextSearchRequest>,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         let area = area_from(request.output, request.window_id, request.region)?;
         let (shot, _) = self
             .watcher
             .capture(&area, screen::DEFAULT_MAX_WIDTH)
             .map_err(failed)?;
         let found = screen::find_text(&shot.native_png, &request.target).map_err(failed)?;
-        if found.is_empty() {
-            return Ok(format!(
-                "no match for {:?} in {}",
-                request.target,
-                area.describe()
-            ));
-        }
-        Ok(matches_described(&shot, &found))
+        let text = if found.is_empty() {
+            format!("no match for {:?} in {}", request.target, area.describe())
+        } else {
+            matches_described(&shot, &found)
+        };
+        Ok(with_facts(
+            CallToolResult::success(vec![ContentBlock::text(text)]),
+            serde_json::json!({"area": area_facts(&area), "matches": match_facts(&shot, &found)}),
+        ))
     }
 
     #[tool(
@@ -1303,7 +1505,7 @@ impl UmbrielServer {
         .await
         .map_err(|cause| failed(cause.into()))?
         .map_err(failed)?;
-        let text = match outcome {
+        let (text, facts) = match outcome {
             watching::TextWait::Found {
                 matches,
                 shot,
@@ -1319,16 +1521,28 @@ impl UmbrielServer {
                     matches_described(&shot, &matches),
                 ];
                 lines.extend(notes);
-                lines.join("\n")
+                let facts = serde_json::json!({
+                    "found": true,
+                    "after_ms": after.as_millis() as u64,
+                    "area": area_facts(&area),
+                    "matches": match_facts(&shot, &matches),
+                });
+                (lines.join("\n"), facts)
             }
-            watching::TextWait::NotFound { attempts } => format!(
-                "no match for {:?} in {} within {} ({attempts} looks)",
-                request.target,
-                area.describe(),
-                watching::seconds(timeout)
+            watching::TextWait::NotFound { attempts } => (
+                format!(
+                    "no match for {:?} in {} within {} ({attempts} looks)",
+                    request.target,
+                    area.describe(),
+                    watching::seconds(timeout)
+                ),
+                serde_json::json!({"found": false, "area": area_facts(&area), "matches": []}),
             ),
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        Ok(with_facts(
+            CallToolResult::success(vec![ContentBlock::text(text)]),
+            facts,
+        ))
     }
 
     #[tool(
@@ -1357,7 +1571,7 @@ impl UmbrielServer {
         .await
         .map_err(|cause| failed(cause.into()))?
         .map_err(failed)?;
-        let (shot, notes, summary) = match outcome {
+        let (shot, notes, summary, change) = match outcome {
             watching::ChangeWait::Settled {
                 shot,
                 notes,
@@ -1370,7 +1584,12 @@ impl UmbrielServer {
                     watching::seconds(changed_after),
                     watching::seconds(settled_after)
                 );
-                (shot, notes, summary)
+                let change = serde_json::json!({
+                    "changed": true, "settled": true,
+                    "changed_after_ms": changed_after.as_millis() as u64,
+                    "settled_after_ms": settled_after.as_millis() as u64,
+                });
+                (shot, notes, summary, change)
             }
             watching::ChangeWait::StillChanging {
                 shot,
@@ -1384,7 +1603,11 @@ impl UmbrielServer {
                     watching::seconds(changed_after),
                     watching::seconds(timeout)
                 );
-                (shot, notes, summary)
+                let change = serde_json::json!({
+                    "changed": true, "settled": false,
+                    "changed_after_ms": changed_after.as_millis() as u64,
+                });
+                (shot, notes, summary, change)
             }
             watching::ChangeWait::Unchanged {
                 since,
@@ -1395,21 +1618,30 @@ impl UmbrielServer {
                 } else {
                     "the first look (there was no earlier capture of it to compare with)"
                 };
-                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                let text = format!(
                     "{} did not change within {}; it still matches {compared_with} from {}.",
                     area.describe(),
                     watching::seconds(timeout),
                     screen::clock_time(since)
-                ))]));
+                );
+                return Ok(with_facts(
+                    CallToolResult::success(vec![ContentBlock::text(text)]),
+                    serde_json::json!({"changed": false, "area": area_facts(&area)}),
+                ));
             }
         };
-        Ok(CallToolResult::success(vec![
-            ContentBlock::image(
-                BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
-                "image/jpeg",
-            ),
-            ContentBlock::text(format!("{summary}\n{}", capture_description(&shot, &notes))),
-        ]))
+        let mut facts = capture_facts(&area, &shot, &notes, None);
+        facts["change"] = change;
+        Ok(with_facts(
+            CallToolResult::success(vec![
+                ContentBlock::image(
+                    BASE64_STANDARD.encode(shot.jpeg().map_err(failed)?),
+                    "image/jpeg",
+                ),
+                ContentBlock::text(format!("{summary}\n{}", capture_description(&shot, &notes))),
+            ]),
+            facts,
+        ))
     }
 
     #[tool(
@@ -1710,7 +1942,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, keybinds with set_keybind and remove_keybind, and rule lists such as window_rule with add_rule, replace_rule and remove_rule, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting.\n\nThe mouse and keyboard are the user's own, on a desktop they may be using at the same time. Ask the user before you click, type or press keys in their windows, unless they asked you to. Prefer capturing one window by window_id over whole monitors: it is sharper and leaves out their other windows. Pass window_id to type_text and key_press so nothing is typed when another window has focus, and to mouse_click to click at coordinates inside that window. After acting, use wait_for_change (it compares with your previous capture of the same window) or wait_for_text instead of sleeping and re-capturing. If focus or a window title changed without you, the user is probably using the desktop: stop and ask."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, keybinds with set_keybind and remove_keybind, and rule lists such as window_rule with add_rule, replace_rule and remove_rule, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. Starting a program (launch_app, or run_action with spawn) asks the user the same way; without a dialog it returns a code for confirm_launch, which you may use only after the user agrees. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting.\n\nThe mouse and keyboard are the user's own, on a desktop they may be using at the same time. Ask the user before you click, type or press keys in their windows, unless they asked you to. Prefer capturing one window by window_id over whole monitors: it is sharper and leaves out their other windows. Pass window_id to type_text and key_press so nothing is typed when another window has focus, and to mouse_click to click at coordinates inside that window. After acting, use wait_for_change (it compares with your previous capture of the same window) or wait_for_text instead of sleeping and re-capturing. If focus or a window title changed without you, the user is probably using the desktop: stop and ask."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(

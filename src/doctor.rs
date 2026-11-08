@@ -33,6 +33,7 @@ pub struct Facts {
     pub compositor_socket: Result<String, String>,
     pub action_protocol: Option<ipc::Protocol>,
     pub grim_captures_any_window: bool,
+    pub umbriel_captures_windows: bool,
     pub protocols: Result<ProtocolGlobals, String>,
     pub grim_installed: bool,
     pub recorder_installed: bool,
@@ -262,6 +263,12 @@ fn grim_check(facts: &Facts) -> Check {
         Prerequisite::Grim,
     );
     match check.outcome {
+        Outcome::Ready(found) if facts.umbriel_captures_windows => Check::ready(
+            GRIM_CHECK,
+            format!(
+                "{found}; windows are captured straight from Umbriel, even on a hidden workspace"
+            ),
+        ),
         Outcome::Ready(found) if facts.grim_captures_any_window => Check::ready(
             GRIM_CHECK,
             format!("{found}; captures any window, even on a hidden workspace"),
@@ -420,6 +427,7 @@ fn gather_facts() -> Facts {
             .then(|| ipc::detect_protocol().ok())
             .flatten(),
         grim_captures_any_window: grim_installed && crate::screen::grim_supports_toplevel_capture(),
+        umbriel_captures_windows: crate::window_capture::available(),
         compositor_socket,
         protocols: protocol_fact(),
         grim_installed,
@@ -453,6 +461,7 @@ mod tests {
             compositor_socket: Ok("/run/user/1000/umbriel-wayland-0.sock".to_owned()),
             action_protocol: Some(crate::ipc::Protocol::TypedActions),
             grim_captures_any_window: true,
+            umbriel_captures_windows: true,
             protocols: Ok(ProtocolGlobals {
                 virtual_pointer: true,
                 virtual_keyboard: true,
@@ -766,6 +775,7 @@ mod tests {
     fn an_older_grim_passes_but_says_what_it_cannot_capture() {
         let mut facts = healthy_facts();
         facts.grim_captures_any_window = false;
+        facts.umbriel_captures_windows = false;
         let checks = diagnose(&facts);
         match &check(&checks, "Screen capture (grim)").outcome {
             Outcome::Ready(detail) => assert!(detail.contains("older than 1.5"), "{detail}"),

@@ -338,6 +338,7 @@ impl McpProcess {
         let mut command = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"));
         command
             .args(args)
+            .env("WAYLAND_DISPLAY", "umbriel-mcp-test-no-display")
             .envs(environment.iter().copied())
             .env("UMBRIEL_SOCKET", socket_path);
         Self::spawn(command, capabilities, approval_reply)

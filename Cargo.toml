@@ -1,6 +1,6 @@
 [package]
 name = "umbriel-mcp"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Nafees Ashker Sakir <nafees.ashker@gmail.com>"]
@@ -32,6 +32,7 @@ toml_edit = "0.25.17"
 sha2 = "0.11.1"
 ed25519-compact = { version = "2.6.0", default-features = false, features = ["std", "pem"] }
 jsonc-parser = { version = "0.34", features = ["cst"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [profile.release]
 strip = true

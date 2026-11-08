@@ -41,6 +41,16 @@ pub struct PendingChanges {
     session_backup_choice: Mutex<Option<bool>>,
 }
 
+fn one_time_code(issued: &AtomicU64) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or_default();
+    let sequence = issued.fetch_add(1, Ordering::SeqCst);
+    let mixed = nanos ^ sequence.rotate_left(32) ^ u64::from(std::process::id()).rotate_left(16);
+    format!("{:012x}", mixed & 0xffff_ffff_ffff)
+}
+
 impl PendingChanges {
     pub fn allow_rest_of_session(&self, keep_backup: bool) {
         *self
@@ -56,19 +66,8 @@ impl PendingChanges {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn new_code(&self) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos() as u64)
-            .unwrap_or_default();
-        let sequence = self.issued.fetch_add(1, Ordering::SeqCst);
-        let mixed =
-            nanos ^ sequence.rotate_left(32) ^ u64::from(std::process::id()).rotate_left(16);
-        format!("{:012x}", mixed & 0xffff_ffff_ffff)
-    }
-
     fn hold(&self, change: PreparedChange) -> String {
-        let code = self.new_code();
+        let code = one_time_code(&self.issued);
         let mut held = self
             .held
             .lock()
@@ -184,6 +183,150 @@ pub async fn ask_then_commit(
         Err(ElicitationError::CapabilityNotSupported) => Ok(hold_for_confirmation(pending, change)),
         Err(error) => Err(anyhow!(
             "could not ask the user to approve the change ({error}); nothing was written"
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LaunchApproval {
+    /// Start this program
+    pub start: bool,
+    /// Also start further programs in this session without asking
+    #[serde(default)]
+    pub allow_rest_of_session: bool,
+}
+
+rmcp::elicit_safe!(LaunchApproval);
+
+#[derive(Clone, Debug)]
+pub enum Launch {
+    App(String),
+    Action(String),
+}
+
+impl Launch {
+    pub fn program(&self) -> &str {
+        match self {
+            Launch::App(command) => command.trim(),
+            Launch::Action(action) => action.trim(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct PendingLaunches {
+    held: Mutex<HashMap<String, (Launch, Instant)>>,
+    issued: AtomicU64,
+    allowed_for_session: std::sync::atomic::AtomicBool,
+}
+
+impl PendingLaunches {
+    pub fn allow_rest_of_session(&self) {
+        self.allowed_for_session.store(true, Ordering::SeqCst);
+    }
+
+    fn allowed_for_session(&self) -> bool {
+        self.allowed_for_session.load(Ordering::SeqCst)
+    }
+
+    fn hold(&self, launch: &Launch) -> String {
+        let code = one_time_code(&self.issued);
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.retain(|_, (_, held_at)| held_at.elapsed() < APPROVAL_WINDOW);
+        held.insert(code.clone(), (launch.clone(), Instant::now()));
+        code
+    }
+
+    pub fn take(&self, code: &str) -> Result<Launch> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (launch, held_at) = held.remove(code.trim()).ok_or_else(|| {
+            anyhow!(
+                "no program is waiting for confirmation code {code}; it was already started, has \
+                 expired, or was never issued. Nothing was started."
+            )
+        })?;
+        if held_at.elapsed() >= APPROVAL_WINDOW {
+            return Err(anyhow!(
+                "confirmation code {code} expired after {} minutes; nothing was started. Make the \
+                 request again.",
+                APPROVAL_WINDOW.as_secs() / 60
+            ));
+        }
+        Ok(launch)
+    }
+}
+
+pub enum LaunchDecision {
+    Start { asked: bool },
+    NotStarted(String),
+}
+
+pub async fn ask_before_launching(
+    peer: &Peer<RoleServer>,
+    pending: &PendingLaunches,
+    launch: &Launch,
+) -> Result<LaunchDecision> {
+    let program = launch.program();
+    if pending.allowed_for_session() {
+        return Ok(LaunchDecision::Start { asked: false });
+    }
+    let hold = || {
+        let code = pending.hold(launch);
+        LaunchDecision::NotStarted(format!(
+            "Nothing was started yet. This client cannot ask the user directly, so ask them now \
+             whether to start this program:\n\n  {program}\n\nOnly after they agree, call \
+             confirm_launch with confirmation \"{code}\". If, and only if, the user explicitly \
+             says to stop asking about programs for the rest of this session, also pass \
+             allow_rest_of_session: true; never set it on your own. The code works once and \
+             expires in {} minutes. If they decline, do nothing.",
+            APPROVAL_WINDOW.as_secs() / 60
+        ))
+    };
+    if !peer
+        .supported_elicitation_modes()
+        .contains(&ElicitationMode::Form)
+    {
+        return Ok(hold());
+    }
+    let question = format!(
+        "umbriel-mcp wants to start a program on your desktop:\n\n  {program}\n\nStart it? You \
+         can also allow starting programs for the rest of this session."
+    );
+    let not_started = |reason: &str| {
+        Ok(LaunchDecision::NotStarted(format!(
+            "{reason}, so {program:?} was not started."
+        )))
+    };
+    match peer
+        .elicit_with_timeout::<LaunchApproval>(question, Some(APPROVAL_WINDOW))
+        .await
+    {
+        Ok(Some(LaunchApproval {
+            start: true,
+            allow_rest_of_session,
+        })) => {
+            if allow_rest_of_session {
+                pending.allow_rest_of_session();
+            }
+            Ok(LaunchDecision::Start { asked: true })
+        }
+        Ok(_)
+        | Err(ElicitationError::UserDeclined)
+        | Err(ElicitationError::UserCancelled)
+        | Err(ElicitationError::NoContent) => not_started("The user did not allow it"),
+        Err(ElicitationError::Service(ServiceError::Timeout { .. })) => not_started(&format!(
+            "The user did not answer within {} minutes",
+            APPROVAL_WINDOW.as_secs() / 60
+        )),
+        Err(ElicitationError::CapabilityNotSupported) => Ok(hold()),
+        Err(error) => Err(anyhow!(
+            "could not ask the user before starting the program ({error}); nothing was started"
         )),
     }
 }

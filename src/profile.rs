@@ -85,6 +85,7 @@ pub const TOOL_ACCESS: &[(&str, Access)] = &[
     ("replace_rule", Access::Control),
     ("remove_rule", Access::Control),
     ("launch_app", Access::Execute),
+    ("confirm_launch", Access::Execute),
 ];
 
 fn access_for_tool(tool: &str) -> Access {

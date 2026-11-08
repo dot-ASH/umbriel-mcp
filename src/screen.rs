@@ -1,4 +1,5 @@
 use crate::placement::OnScreen;
+use crate::window_capture::NativeCapture;
 use anyhow::{Context, Result, anyhow};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
@@ -138,6 +139,9 @@ pub struct Capture {
     pub window_title: Option<String>,
     pub fingerprint: Fingerprint,
     pub notes: Vec<String>,
+    pub captured_by: &'static str,
+    pub screen_width: u32,
+    pub screen_height: u32,
 }
 
 impl Capture {
@@ -168,6 +172,9 @@ impl Capture {
             window_title: None,
             fingerprint,
             notes: Vec::new(),
+            captured_by: "grim",
+            screen_width: native_width,
+            screen_height: native_height,
         })
     }
 
@@ -190,30 +197,51 @@ impl Capture {
     }
 
     pub fn coordinate_note(&self) -> String {
-        let factor = self.native_width as f64 / self.encoded_width.max(1) as f64;
+        let factor_x = self.screen_width as f64 / self.encoded_width.max(1) as f64;
+        let factor_y = self.screen_height as f64 / self.encoded_height.max(1) as f64;
+        let density =
+            if (self.native_width, self.native_height) == (self.screen_width, self.screen_height) {
+                String::new()
+            } else {
+                format!(
+                    " It was captured at {}x{} pixels because the monitor is scaled.",
+                    self.native_width, self.native_height
+                )
+            };
         let visibility: String = self.notes.iter().map(|note| format!(" {note}")).collect();
         format!(
-            "Image is {}x{} covering a {}x{} region whose top-left is absolute ({}, {}). \
+            "Image is {}x{} covering a {}x{} screen area whose top-left is absolute ({}, {}). \
              To convert: screen_x = image_x * {:.4} + {}, screen_y = image_y * {:.4} + {}. \
-             Captured at {}.{visibility}",
+             Captured at {}.{density}{visibility}",
             self.encoded_width,
             self.encoded_height,
-            self.native_width,
-            self.native_height,
+            self.screen_width,
+            self.screen_height,
             self.origin_x,
             self.origin_y,
-            factor,
+            factor_x,
             self.origin_x,
-            factor,
+            factor_y,
             self.origin_y,
             clock_time(self.captured_at)
         )
     }
 
-    pub fn screen_point(&self, image_x: u32, image_y: u32) -> (i64, i64) {
+    pub fn covering_screen_area(mut self, width: i64, height: i64) -> Self {
+        if width > 0 && height > 0 {
+            self.screen_width = width as u32;
+            self.screen_height = height as u32;
+        }
+        self
+    }
+
+    pub fn screen_point(&self, native_x: u32, native_y: u32) -> (i64, i64) {
+        let scale = |value: u32, screen: u32, native: u32| {
+            (value as f64 * screen as f64 / native.max(1) as f64).round() as i64
+        };
         (
-            i64::from(image_x) + self.origin_x,
-            i64::from(image_y) + self.origin_y,
+            scale(native_x, self.screen_width, self.native_width) + self.origin_x,
+            scale(native_y, self.screen_height, self.native_height) + self.origin_y,
         )
     }
 }
@@ -239,26 +267,8 @@ fn grim(extra_args: &[String]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
-fn output_origin(output_name: &str) -> (i64, i64) {
-    let Ok(outputs) = crate::ipc::query("outputs") else {
-        return (0, 0);
-    };
-    let Some(entries) = outputs.as_array() else {
-        return (0, 0);
-    };
-    for entry in entries {
-        if entry.get("name").and_then(|v| v.as_str()) == Some(output_name) {
-            let position = entry.get("position");
-            let read = |key: &str| {
-                position
-                    .and_then(|p| p.get(key))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-            };
-            return (read("x"), read("y"));
-        }
-    }
-    (0, 0)
+fn output_area(output_name: &str) -> Option<crate::placement::Rect> {
+    crate::placement::output_rect(&crate::ipc::listed("outputs"), output_name)
 }
 
 pub fn grim_supports_toplevel_capture() -> bool {
@@ -340,11 +350,49 @@ fn capture_from_screen(
     Ok((grim(&["-g".into(), placement.geometry.clone()])?, notes))
 }
 
-fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlacement, Vec<String>)> {
+struct WindowPicture {
+    png: Vec<u8>,
+    placement: crate::ipc::WindowPlacement,
+    notes: Vec<String>,
+    captured_by: &'static str,
+}
+
+fn capture_window(window_id: &str) -> Result<WindowPicture> {
     let placement = crate::ipc::window_placement(window_id)?;
-    if !grim_supports_toplevel_capture() {
-        let (png, notes) = capture_from_screen(window_id, &placement)?;
-        return Ok((png, placement, notes));
+    let visibility = || {
+        visibility_note(window_id, placement.on_screen)
+            .into_iter()
+            .collect()
+    };
+    match crate::window_capture::capture(window_id) {
+        NativeCapture::Captured(png) => {
+            let notes = visibility();
+            return Ok(WindowPicture {
+                png,
+                placement,
+                notes,
+                captured_by: "umbriel",
+            });
+        }
+        NativeCapture::NoSuchWindow => {
+            return Err(anyhow!("no window with id {window_id} can be captured"));
+        }
+        NativeCapture::Unavailable(reason) => {
+            if !grim_supports_toplevel_capture() {
+                let (png, notes) = capture_from_screen(window_id, &placement).map_err(|error| {
+                    anyhow!(
+                        "{error:#} (umbriel-mcp could not capture the window itself either: \
+                         {reason})"
+                    )
+                })?;
+                return Ok(WindowPicture {
+                    png,
+                    placement,
+                    notes,
+                    captured_by: "screen area (grim)",
+                });
+            }
+        }
     }
     let png = grim(&["-T".into(), window_id.to_owned()]).map_err(|error| {
         if error.to_string().contains("cannot find toplevel") {
@@ -353,30 +401,43 @@ fn capture_window(window_id: &str) -> Result<(Vec<u8>, crate::ipc::WindowPlaceme
             error
         }
     })?;
-    let notes = visibility_note(window_id, placement.on_screen)
-        .into_iter()
-        .collect();
-    Ok((png, placement, notes))
+    let notes = visibility();
+    Ok(WindowPicture {
+        png,
+        placement,
+        notes,
+        captured_by: "grim -T",
+    })
 }
 
 pub fn capture(area: &Area, max_width: u32) -> Result<Capture> {
-    let (png, origin) = match area {
+    match area {
         Area::Window(id) => {
-            let (png, placement, notes) = capture_window(id)?;
-            let mut capture = Capture::from_png(&png, placement.origin, max_width)?;
-            capture.shown_on_screen = placement.shown_on_screen;
-            capture.window_title = placement.title;
-            capture.notes = notes;
-            return Ok(capture);
+            let picture = capture_window(id)?;
+            let (width, height) = picture.placement.size;
+            let mut capture = Capture::from_png(&picture.png, picture.placement.origin, max_width)?
+                .covering_screen_area(width, height);
+            capture.shown_on_screen = picture.placement.shown_on_screen;
+            capture.window_title = picture.placement.title;
+            capture.notes = picture.notes;
+            capture.captured_by = picture.captured_by;
+            Ok(capture)
         }
-        Area::Output(name) => (grim(&["-o".into(), name.to_string()])?, output_origin(name)),
-        Area::Region(region) => (
-            grim(&["-g".into(), region.geometry()])?,
-            (region.x, region.y),
-        ),
-        Area::WholeScreen => (grim(&[])?, (0, 0)),
-    };
-    Capture::from_png(&png, origin, max_width)
+        Area::Output(name) => {
+            let png = grim(&["-o".into(), name.to_string()])?;
+            match output_area(name) {
+                Some(area) => Ok(Capture::from_png(&png, (area.x, area.y), max_width)?
+                    .covering_screen_area(area.width, area.height)),
+                None => Capture::from_png(&png, (0, 0), max_width),
+            }
+        }
+        Area::Region(region) => {
+            let png = grim(&["-g".into(), region.geometry()])?;
+            Ok(Capture::from_png(&png, (region.x, region.y), max_width)?
+                .covering_screen_area(i64::from(region.width), i64::from(region.height)))
+        }
+        Area::WholeScreen => Capture::from_png(&grim(&[])?, (0, 0), max_width),
+    }
 }
 
 const TESSERACT_INSTALL_ADVICE: &str = "run `umbriel-mcp doctor` to see what to install";
@@ -843,5 +904,36 @@ mod tests {
         .join("\n");
 
         assert_eq!(matches_in_tsv(&tsv, "open the file").len(), 1);
+    }
+
+    fn blank_png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        DynamicImage::new_rgb8(width, height)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    #[test]
+    fn a_capture_from_a_scaled_monitor_maps_its_pixels_onto_the_logical_screen() {
+        let capture = Capture::from_png(&blank_png(3840, 2160), (1920, 0), 1024)
+            .unwrap()
+            .covering_screen_area(1920, 1080);
+
+        assert_eq!(capture.screen_point(200, 100), (2020, 50));
+        let note = capture.coordinate_note();
+        assert!(note.contains("covering a 1920x1080 screen area"), "{note}");
+        assert!(note.contains("image_x * 1.8750 + 1920"), "{note}");
+        assert!(note.contains("captured at 3840x2160 pixels"), "{note}");
+    }
+
+    #[test]
+    fn an_unscaled_capture_maps_pixels_one_to_one() {
+        let capture = Capture::from_png(&blank_png(900, 500), (12, 46), 1024)
+            .unwrap()
+            .covering_screen_area(900, 500);
+
+        assert_eq!(capture.screen_point(10, 20), (22, 66));
+        assert!(!capture.coordinate_note().contains("scaled"));
     }
 }
