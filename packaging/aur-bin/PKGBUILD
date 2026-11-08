@@ -17,8 +17,8 @@ optdepends=('umbriel-git: the compositor this server controls'
             'wf-recorder: screen recording')
 source_x86_64=("$_binary-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-x86_64-linux.tar.gz")
 source_aarch64=("$_binary-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_binary-v$pkgver-aarch64-linux.tar.gz")
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('19e7d787243c5ac3868ff171d7021a077cd5cc57cf3e51b2859ecdae5e4d7c48')
+sha256sums_aarch64=('ecd7380e43aff3d4345424b61d25f47bde46178f1b179b29b6a761e3b1cde6a5')
 
 package() {
   cd "$_binary-v$pkgver-$CARCH-linux"
