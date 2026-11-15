@@ -3520,3 +3520,47 @@ fn allowing_config_changes_does_not_allow_starting_programs() {
         server.approval_questions
     );
 }
+
+fn tool_description(server: &mut McpProcess, name: &str) -> String {
+    let tools = server.request("tools/list", json!({}));
+    tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .and_then(|tool| tool["description"].as_str())
+        .unwrap_or_else(|| panic!("{name} missing"))
+        .to_owned()
+}
+
+#[test]
+fn ws_is_understood_as_workspace_and_looking_at_one_captures_its_windows() {
+    let fake = FakeUmbriel::start(canned_replies());
+    let mut server = McpProcess::start(&fake.path);
+
+    let initialized = server.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "ws-check", "version": "1" }
+        }),
+    );
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+
+    assert!(instructions.contains("\"ws\""), "{instructions}");
+    assert!(instructions.contains("look at my ws 1"), "{instructions}");
+    assert!(instructions.contains("without switching"), "{instructions}");
+    for tool in [
+        "list_windows",
+        "list_workspaces",
+        "switch_workspace",
+        "move_window_to_workspace",
+    ] {
+        let description = tool_description(&mut server, tool);
+        assert!(description.contains("(ws)"), "{tool}: {description}");
+    }
+}

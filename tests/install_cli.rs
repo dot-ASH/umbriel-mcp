@@ -24,6 +24,7 @@ fn run_install(arguments: &[&str], programs: &Path, home: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
         .arg("install")
         .args(arguments)
+        .env_remove("PI_CODING_AGENT_DIR")
         .env("PATH", programs)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -76,10 +77,6 @@ fn pi_registration_runs_the_pi_cli_with_direct_exposure() {
     assert!(arguments[8].ends_with("umbriel-mcp"), "{arguments:?}");
     assert!(!arguments.contains(&"--profile".to_owned()));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Registered umbriel"));
-    assert!(
-        directory_is_empty(&home),
-        "install must not write into HOME"
-    );
 }
 
 #[test]
@@ -335,4 +332,108 @@ fn reinstalling_claude_code_removes_the_old_entry_quietly_then_adds() {
         invocations[1].ends_with("--profile read-only"),
         "{invocations:?}"
     );
+}
+
+const PI_EXTENSION: &str = include_str!("../integrations/pi/umbriel-approval.ts");
+
+fn pi_extension(home: &Path) -> PathBuf {
+    home.join(".pi/agent/extensions/umbriel-approval.ts")
+}
+
+#[test]
+fn registering_pi_also_installs_its_approval_dialog() {
+    let programs = scratch_directory("pi-bin");
+    let home = scratch_directory("pi-home");
+    install_recording_program(&programs, "pi", 0);
+
+    let output = run_install(&["pi"], &programs, &home);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(pi_extension(&home)).unwrap(),
+        PI_EXTENSION
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("approval dialog"));
+}
+
+#[test]
+fn the_pi_dialog_goes_where_pi_coding_agent_dir_points() {
+    let programs = scratch_directory("pi-bin");
+    let home = scratch_directory("pi-home");
+    let agent_dir = scratch_directory("pi-agent-dir");
+    install_recording_program(&programs, "pi", 0);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_umbriel-mcp"))
+        .args(["install", "pi"])
+        .env("PATH", &programs)
+        .env("HOME", &home)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .output()
+        .expect("run install");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(agent_dir.join("extensions/umbriel-approval.ts").is_file());
+    assert!(directory_is_empty(&home));
+}
+
+#[test]
+fn a_changed_copy_of_the_pi_dialog_is_kept_as_a_backup_when_replaced() {
+    let programs = scratch_directory("pi-bin");
+    let home = scratch_directory("pi-home");
+    install_recording_program(&programs, "pi", 0);
+    std::fs::create_dir_all(pi_extension(&home).parent().unwrap()).unwrap();
+    std::fs::write(pi_extension(&home), "my edited copy").unwrap();
+
+    let output = run_install(&["pi"], &programs, &home);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(pi_extension(&home)).unwrap(),
+        PI_EXTENSION
+    );
+    let backup = pi_extension(&home).with_extension("ts.bak");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), "my edited copy");
+}
+
+#[test]
+fn no_extension_registers_pi_without_the_dialog() {
+    let programs = scratch_directory("pi-bin");
+    let home = scratch_directory("pi-home");
+    install_recording_program(&programs, "pi", 0);
+
+    let output = run_install(&["pi", "--no-extension"], &programs, &home);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        directory_is_empty(&home),
+        "install must not write into HOME"
+    );
+}
+
+#[test]
+fn a_failed_pi_registration_installs_no_dialog() {
+    let programs = scratch_directory("pi-bin");
+    let home = scratch_directory("pi-home");
+    install_recording_program(&programs, "pi", 1);
+
+    let output = run_install(&["pi"], &programs, &home);
+
+    assert!(!output.status.success());
+    assert!(directory_is_empty(&home));
 }

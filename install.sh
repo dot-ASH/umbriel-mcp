@@ -28,10 +28,15 @@ done
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 
-curl -fsSL "$releases/latest/download/SHA256SUMS" -o "$work/SHA256SUMS" ||
+curl -fsSL --retry 3 --retry-delay 1 "$releases/latest/download/SHA256SUMS" -o "$work/SHA256SUMS" ||
   fail "could not download the release checksums from $releases"
-curl -fsSL "$releases/latest/download/SHA256SUMS.sig" -o "$work/SHA256SUMS.sig" ||
-  fail "the latest release is not signed (it has no SHA256SUMS.sig); nothing was installed"
+if ! curl -fsSL --retry 3 --retry-delay 1 "$releases/latest/download/SHA256SUMS.sig" \
+  -o "$work/SHA256SUMS.sig" 2>"$work/signature-error"; then
+  if grep -qE 'error: 404|\(37\)' "$work/signature-error"; then
+    fail "the latest release is not signed (it has no SHA256SUMS.sig); nothing was installed"
+  fi
+  fail "could not download the release signature ($(cat "$work/signature-error")); GitHub may be having trouble, so try again in a few minutes. Nothing was installed"
+fi
 
 if [ -n "${UMBRIEL_MCP_RELEASE_KEY:-}" ]; then
   cp "$UMBRIEL_MCP_RELEASE_KEY" "$work/release-key.pem"
@@ -50,7 +55,7 @@ tag="${asset#umbriel-mcp-}"
 tag="${tag%-"$arch"-linux.tar.gz}"
 
 echo "Downloading umbriel-mcp $tag for $arch..."
-curl -fsSL "$releases/download/$tag/$asset" -o "$work/$asset" || fail "could not download $asset"
+curl -fsSL --retry 3 --retry-delay 1 "$releases/download/$tag/$asset" -o "$work/$asset" || fail "could not download $asset"
 
 awk -v file="$asset" '$2 == file' "$work/SHA256SUMS" >"$work/expected"
 (cd "$work" && sha256sum -c expected >/dev/null 2>&1) ||

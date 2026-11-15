@@ -171,6 +171,7 @@ fn claude_lists_umbriel_mcp() -> bool {
 enum Step {
     EditFile(ConfigFile),
     Claude,
+    RemovePiDialog(PathBuf),
     RemoveBinary(PathBuf),
 }
 
@@ -188,6 +189,10 @@ impl Step {
                     CLAUDE_REMOVAL.join(" ")
                 )
             }
+            Step::RemovePiDialog(path) => format!(
+                "pi: the umbriel-mcp approval dialog extension {}",
+                path.display()
+            ),
             Step::RemoveBinary(path) => format!("the program {}", path.display()),
         }
     }
@@ -216,6 +221,14 @@ impl Step {
                 }
                 Ok("Removed umbriel from Claude Code.".to_owned())
             }
+            Step::RemovePiDialog(path) => std::fs::remove_file(path)
+                .map(|()| {
+                    format!(
+                        "Removed pi's approval dialog for umbriel-mcp ({}).",
+                        path.display()
+                    )
+                })
+                .map_err(|error| anyhow!("cannot remove {}: {error}", path.display())),
             Step::RemoveBinary(path) => match std::fs::remove_file(path) {
                 Ok(()) => Ok(format!("Removed {}.", path.display())),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(
@@ -259,6 +272,12 @@ fn plan(home: &Path, config_home: &Path, keep_binary: bool) -> Result<Plan> {
     }
     if found_on_path("claude").is_some() && claude_lists_umbriel_mcp() {
         plan.steps.push(Step::Claude);
+    }
+    if let Some(folder) = crate::register::pi_extensions_folder() {
+        let dialog = folder.join(crate::register::PI_APPROVAL_EXTENSION_FILE);
+        if dialog.is_file() {
+            plan.steps.push(Step::RemovePiDialog(dialog));
+        }
     }
     if !keep_binary {
         let (invoked, resolved) = invoked_executable()?;

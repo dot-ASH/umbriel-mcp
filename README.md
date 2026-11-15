@@ -112,7 +112,7 @@ planned; this section will switch to `yay -S umbriel-mcp-bin` once it is publish
 
    ```sh
    arch=$(uname -m)   # x86_64 or aarch64
-   tag=v0.4.3
+   tag=v0.4.4
    base="https://github.com/dot-ASH/umbriel-mcp/releases/download/$tag"
    curl -LO "$base/umbriel-mcp-$tag-$arch-linux.tar.gz"
    curl -LO "$base/SHA256SUMS"
@@ -361,6 +361,15 @@ rule as JSON and a position counted from 1 in the order `read_config` shows.
   permission prompt or extension can ask you as well.
 - A code expires after 10 minutes, works once, and is refused if the file changed since the
   preview.
+
+**A real dialog in pi:** pi does not support MCP dialogs yet, so `umbriel-mcp install pi` also
+installs a small pi extension (`~/.pi/agent/extensions/umbriel-approval.ts`, or under
+`$PI_CODING_AGENT_DIR`) that asks you in pi's own dialog whenever the model uses a confirmation
+code: for config changes (apply, apply without a backup, apply and stop asking this session,
+or don't apply) and for starting programs. The model cannot answer that dialog or choose the
+session permission for you. Run `umbriel-mcp install pi` again after updating to refresh it,
+pass `--no-extension` to skip it, and `umbriel-mcp uninstall` removes it. The source is in
+[`integrations/pi/umbriel-approval.ts`](integrations/pi/umbriel-approval.ts).
 
 **Making several changes in a row** — the approval also offers to stop asking for the rest of
 the session: a checkbox in the dialog, or, in clients without one, telling the model you don't

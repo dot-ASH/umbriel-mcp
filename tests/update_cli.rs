@@ -453,3 +453,154 @@ fn the_installer_refuses_unsigned_and_wrongly_signed_releases() {
     assert_installer_refused(Signing::WrongKey, "signature does not match");
     assert_installer_refused(Signing::SumsEditedAfterwards, "signature does not match");
 }
+
+struct FlakyServer {
+    base: String,
+    signature_requests: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl FlakyServer {
+    fn serving(release: &FakeRelease, failures_before_the_signature_arrives: u32) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let root = release.root.clone();
+        let signature_requests = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = std::sync::Arc::clone(&signature_requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                    header.clear();
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_owned();
+                let file = root.join(path.trim_start_matches('/'));
+                let gateway_timeout = path.ends_with(".sig")
+                    && counter.fetch_add(1, Ordering::SeqCst)
+                        < failures_before_the_signature_arrives;
+                let (status, body) = match std::fs::read(&file) {
+                    _ if gateway_timeout => ("504 Gateway Timeout", b"busy".to_vec()),
+                    Ok(body) => ("200 OK", body),
+                    Err(_) => ("404 Not Found", b"missing".to_vec()),
+                };
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        Self {
+            base,
+            signature_requests,
+        }
+    }
+}
+
+fn update_installing_from(
+    server: &FlakyServer,
+    release: &FakeRelease,
+    executable: &Path,
+) -> Output {
+    for _ in 0..100 {
+        match Command::new(executable)
+            .arg("update")
+            .env("UMBRIEL_MCP_RELEASES", &server.base)
+            .env("UMBRIEL_MCP_RELEASE_KEY", &release.public_key)
+            .env("PATH", SYSTEM_PATH)
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.expect("run update"),
+        }
+    }
+    panic!("{} stayed busy", executable.display())
+}
+
+#[test]
+fn a_signature_that_fails_to_download_once_is_retried() {
+    let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
+    let server = FlakyServer::serving(&release, 1);
+    let executable = installed_copy(&scratch_directory("flaky"));
+
+    let output = update_installing_from(&server, &release, &executable);
+
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        server
+            .signature_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 2
+    );
+}
+
+#[test]
+fn a_signature_the_server_keeps_failing_to_send_is_not_called_unsigned() {
+    let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
+    let server = FlakyServer::serving(&release, u32::MAX);
+    let executable = installed_copy(&scratch_directory("flaky"));
+
+    let output = update_installing_from(&server, &release, &executable);
+
+    let report = text(&output);
+    assert!(!output.status.success(), "{report}");
+    assert!(!report.contains("not signed"), "{report}");
+    assert!(report.contains("could not download"), "{report}");
+    assert!(report.contains("try again"), "{report}");
+    assert!(is_original(&executable));
+}
+
+#[test]
+fn a_signature_missing_from_a_web_server_is_still_called_unsigned() {
+    let release =
+        FakeRelease::publish_signed("99.0.0", &fake_binary("99.0.0"), false, Signing::Missing);
+    let server = FlakyServer::serving(&release, 0);
+    let executable = installed_copy(&scratch_directory("flaky"));
+
+    let output = update_installing_from(&server, &release, &executable);
+
+    assert!(text(&output).contains("is not signed"), "{}", text(&output));
+    assert!(is_original(&executable));
+}
+
+fn run_installer_from(server: &FlakyServer, release: &FakeRelease, home: &Path) -> Output {
+    Command::new("sh")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .env("UMBRIEL_MCP_RELEASES", &server.base)
+        .env("UMBRIEL_MCP_RELEASE_KEY", &release.public_key)
+        .env("HOME", home)
+        .env_remove("UMBRIEL_MCP_INSTALL_DIR")
+        .env("PATH", SYSTEM_PATH)
+        .output()
+        .expect("run install.sh")
+}
+
+#[test]
+fn the_installer_retries_and_does_not_call_a_failed_download_unsigned() {
+    let release = FakeRelease::publish("99.0.0", &fake_binary("99.0.0"), false);
+
+    let flaky_once = FlakyServer::serving(&release, 1);
+    let home = scratch_directory("installer-flaky");
+    let installed = run_installer_from(&flaky_once, &release, &home);
+    assert!(installed.status.success(), "{}", text(&installed));
+
+    let always_failing = FlakyServer::serving(&release, u32::MAX);
+    let home = scratch_directory("installer-flaky");
+    let failed = run_installer_from(&always_failing, &release, &home);
+    let report = text(&failed);
+    assert!(!failed.status.success(), "{report}");
+    assert!(!report.contains("not signed"), "{report}");
+    assert!(report.contains("try again"), "{report}");
+}

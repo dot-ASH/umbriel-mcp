@@ -75,6 +75,7 @@ fn uninstall_with(executable: &Path, arguments: &[&str], home: &Path, programs: 
         .arg("uninstall")
         .args(arguments)
         .env("HOME", home)
+        .env_remove("PI_CODING_AGENT_DIR")
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("PATH", format!("{}:/usr/bin:/bin", programs.display()))
         .stdin(Stdio::null())
@@ -247,6 +248,7 @@ fn run_copy(executable: &Path, home: &Path, programs: &Path) -> Output {
         match Command::new(executable)
             .args(["uninstall", "--yes"])
             .env("HOME", home)
+            .env_remove("PI_CODING_AGENT_DIR")
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("PATH", format!("{}:/usr/bin:/bin", programs.display()))
             .stdin(Stdio::null())
@@ -312,4 +314,25 @@ fn backups_and_recordings_are_listed_but_kept() {
             .exists()
     );
     assert!(home.join("Videos/umbriel-mcp/recording.mp4").exists());
+}
+
+#[test]
+fn the_pi_approval_dialog_is_removed_with_the_registration() {
+    let home = scratch_directory("uninstall-home");
+    let programs = scratch_directory("uninstall-programs");
+    write(&home.join(".pi/agent/mcp.json"), PI_CONFIG);
+    let extension = home.join(".pi/agent/extensions/umbriel-approval.ts");
+    write(&extension, "export default function () {}");
+    write(&home.join(".pi/agent/extensions/other.ts"), "keep");
+
+    let output = uninstall(&["--yes", "--keep-binary"], &home, &programs);
+
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(!extension.exists());
+    assert!(home.join(".pi/agent/extensions/other.ts").exists());
+    assert!(
+        stdout(&output).contains("approval dialog"),
+        "{}",
+        stdout(&output)
+    );
 }

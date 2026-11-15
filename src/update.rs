@@ -134,7 +134,15 @@ fn releases_base() -> String {
 
 fn curl(url: &str, timeout_seconds: &str, destination: Option<&Path>) -> Result<Vec<u8>> {
     let mut command = Command::new("curl");
-    command.args(["-fsSL", "--max-time", timeout_seconds]);
+    command.args([
+        "-fsSL",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "1",
+        "--max-time",
+        timeout_seconds,
+    ]);
     if let Some(destination) = destination {
         command.arg("-o").arg(destination);
     }
@@ -156,6 +164,11 @@ fn latest(timeout_seconds: &str) -> Result<(Release, String)> {
     newest_in(sums)
 }
 
+fn is_missing_file(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("error: 404") || message.contains("(37)")
+}
+
 fn latest_signed() -> Result<(Release, String)> {
     let base = releases_base();
     let sums = curl(
@@ -168,11 +181,18 @@ fn latest_signed() -> Result<(Release, String)> {
         DOWNLOAD_TIMEOUT_SECONDS,
         None,
     )
-    .map_err(|_| {
-        anyhow!(
-            "the latest release is not signed (it has no SHA256SUMS.sig), so it was not \
-             installed; nothing was changed"
-        )
+    .map_err(|error| {
+        if is_missing_file(&error) {
+            anyhow!(
+                "the latest release is not signed (it has no SHA256SUMS.sig), so it was not \
+                 installed; nothing was changed"
+            )
+        } else {
+            anyhow!(
+                "{error:#}. The release's signature could not be downloaded, so nothing was \
+                 changed; GitHub may be having trouble, so try again in a few minutes"
+            )
+        }
     })?;
     verify_release_signature(&trusted_release_key()?, &sums, &signature)?;
     newest_in(String::from_utf8_lossy(&sums).into_owned())

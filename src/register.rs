@@ -306,9 +306,58 @@ fn execute(registration: Registration) -> Result<()> {
     Ok(())
 }
 
-pub fn run(harness: Harness, profile: Option<Profile>) -> ExitCode {
+pub const PI_APPROVAL_EXTENSION: &str = include_str!("../integrations/pi/umbriel-approval.ts");
+pub const PI_APPROVAL_EXTENSION_FILE: &str = "umbriel-approval.ts";
+
+pub fn pi_extensions_folder() -> Option<std::path::PathBuf> {
+    let agent_folder = match std::env::var_os("PI_CODING_AGENT_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".pi/agent"),
+    };
+    Some(agent_folder.join("extensions"))
+}
+
+fn install_pi_approval_dialog() -> Result<String> {
+    let folder = pi_extensions_folder().ok_or_else(|| {
+        anyhow!("cannot find pi's folder: neither PI_CODING_AGENT_DIR nor HOME is set")
+    })?;
+    let target = folder.join(PI_APPROVAL_EXTENSION_FILE);
+    let existing = std::fs::read_to_string(&target).ok();
+    if existing.as_deref() == Some(PI_APPROVAL_EXTENSION) {
+        return Ok(format!(
+            "pi's approval dialog for umbriel-mcp is already installed at {}.",
+            target.display()
+        ));
+    }
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| anyhow!("cannot create {}: {error}", folder.display()))?;
+    let mut kept = String::new();
+    if existing.is_some() {
+        let backup = target.with_extension("ts.bak");
+        std::fs::rename(&target, &backup)
+            .map_err(|error| anyhow!("cannot keep the old {}: {error}", target.display()))?;
+        kept = format!(" The previous copy is saved as {}.", backup.display());
+    }
+    std::fs::write(&target, PI_APPROVAL_EXTENSION)
+        .map_err(|error| anyhow!("cannot write {}: {error}", target.display()))?;
+    Ok(format!(
+        "Installed pi's approval dialog for umbriel-mcp at {}: config changes and program \
+         launches are confirmed in a pi dialog the model cannot answer. Skip it with \
+         --no-extension.{kept}",
+        target.display()
+    ))
+}
+
+pub fn run(harness: Harness, profile: Option<Profile>, with_extension: bool) -> ExitCode {
     let registration = plan(harness, profile, &server_command_for_registration());
-    match execute(registration) {
+    let registered = execute(registration);
+    let registered = match registered {
+        Ok(()) if harness == Harness::Pi && with_extension => install_pi_approval_dialog()
+            .map(|report| println!("{report}"))
+            .map_err(|error| anyhow!("umbriel was registered, but {error:#}")),
+        other => other,
+    };
+    match registered {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");

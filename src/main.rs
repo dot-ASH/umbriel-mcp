@@ -278,7 +278,7 @@ struct WindowFilter {
     /// Also include every field Umbriel reports (effects, tabs, scratchpad and so on); omit for
     /// the brief form
     detail: Option<bool>,
-    /// Workspace to list: a number or name such as "4" (that workspace on every monitor),
+    /// Workspace (ws) to list: a number or name such as "4" for "ws 4" (that workspace on every monitor),
     /// or a full id such as "HDMI-A-1:4"
     workspace: Option<String>,
     /// Only list windows on this output, such as "DP-1"
@@ -297,7 +297,7 @@ struct DetailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WorkspaceTarget {
-    /// Workspace position (1-64) or exact name
+    /// Workspace (ws) position (1-64) or exact name; "ws 2" means "2"
     workspace: String,
     /// Restrict the selection to this output, such as "HDMI-A-1"
     output: Option<String>,
@@ -987,7 +987,7 @@ impl UmbrielServer {
 #[tool_router]
 impl UmbrielServer {
     #[tool(
-        description = "List the windows open on this desktop with id, app_id, title, geometry, monitor and workspace; filter by workspace, output, app_id or pid. Use it to answer what is open or what is on workspace 4; pass workspace \"4\" for that workspace on every monitor. has_keyboard_focus is true for the one window that receives typing. on_screen is fully, partly, scrolled_out_of_view (on the shown workspace but scrolled away) or hidden (another workspace, minimized or a hidden tab). Umbriel's own visible means only that its workspace is shown, and its focused is each workspace's remembered focus, true on several windows at once; detail adds those and every other field Umbriel reports."
+        description = "List the windows open on this desktop with id, app_id, title, geometry, monitor and workspace (ws); filter by workspace, output, app_id or pid. Use it to answer what is open or what is on workspace 4; pass workspace \"4\" for that workspace on every monitor. has_keyboard_focus is true for the one window that receives typing. on_screen is fully, partly, scrolled_out_of_view (on the shown workspace but scrolled away) or hidden (another workspace, minimized or a hidden tab). Umbriel's own visible means only that its workspace is shown, and its focused is each workspace's remembered focus, true on several windows at once; detail adds those and every other field Umbriel reports."
     )]
     fn list_windows(
         &self,
@@ -1024,7 +1024,7 @@ impl UmbrielServer {
     }
 
     #[tool(
-        description = "List this desktop's workspaces with monitor, index, layout, window count and focus. Each monitor has its own numbered workspaces."
+        description = "List this desktop's workspaces (ws) with monitor, index, layout, window count and focus. Each monitor has its own numbered workspaces."
     )]
     fn list_workspaces(&self) -> Result<String, ErrorData> {
         as_pretty_json(ipc::query("workspaces").map_err(failed)?)
@@ -1068,7 +1068,7 @@ impl UmbrielServer {
     }
 
     #[tool(
-        description = "Switch to a workspace by position or name, optionally scoped to an output."
+        description = "Switch to a workspace (ws) by position or name, optionally scoped to an output; \"ws 2\" means workspace \"2\"."
     )]
     fn switch_workspace(
         &self,
@@ -1129,7 +1129,9 @@ impl UmbrielServer {
         ))
     }
 
-    #[tool(description = "Move the focused window to a workspace, optionally scoped to an output.")]
+    #[tool(
+        description = "Move the focused window to a workspace (ws), optionally scoped to an output; \"ws 5\" means workspace \"5\"."
+    )]
     fn move_window_to_workspace(
         &self,
         Parameters(target): Parameters<WorkspaceTarget>,
@@ -1942,7 +1944,7 @@ impl UmbrielServer {
 
 #[tool_handler(
     name = "umbriel-mcp",
-    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, keybinds with set_keybind and remove_keybind, and rule lists such as window_rule with add_rule, replace_rule and remove_rule, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. Starting a program (launch_app, or run_action with spawn) asks the user the same way; without a dialog it returns a code for confirm_launch, which you may use only after the user agrees. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting.\n\nThe mouse and keyboard are the user's own, on a desktop they may be using at the same time. Ask the user before you click, type or press keys in their windows, unless they asked you to. Prefer capturing one window by window_id over whole monitors: it is sharper and leaves out their other windows. Pass window_id to type_text and key_press so nothing is typed when another window has focus, and to mouse_click to click at coordinates inside that window. After acting, use wait_for_change (it compares with your previous capture of the same window) or wait_for_text instead of sleeping and re-capturing. If focus or a window title changed without you, the user is probably using the desktop: stop and ask."
+    instructions = "Inspect and control this desktop's windows, workspaces, monitors, input, screen and clipboard (Umbriel Wayland compositor).\n\nThis desktop runs Umbriel, not Hyprland, Sway, i3 or X11, so hyprctl, swaymsg, i3-msg, wmctrl and xdotool do not work here; answer questions about open windows, workspaces and monitors with these tools. Each monitor has its own numbered workspaces: list_windows with workspace \"4\" shows workspace 4 on every monitor. Users often write \"ws\" for workspace, as in \"ws 1\", \"ws1\" or \"ws2 on DP-1\": pass just the number or name (\"1\") as the workspace. When they say \"look at my ws 1\" or \"what's on workspace 1\", call list_windows with workspace \"1\", then screenshot each window there by window_id; that works without switching workspaces, even when workspace 1 is not shown. Only switch workspaces when they ask to go to one. Window and workspace state come straight from Umbriel's IPC socket; use run_action for any compositor action without a dedicated tool. For questions about Umbriel itself, use umbriel_info (version and state), list_actions (what it can do), config_options (valid config keys) and read_config (the user's keybinds and settings) instead of guessing. Change settings with set_option and reset_option, keybinds with set_keybind and remove_keybind, and rule lists such as window_rule with add_rule, replace_rule and remove_rule, rather than editing the config file directly. Every config change needs the user's approval: where the client supports it the user is asked in a dialog; otherwise the tool returns a preview and a confirmation code, and you must show the user the change, ask whether to apply it and whether to keep a backup, and wait for their explicit answer before calling apply_config_change. Never approve a change on the user's behalf. Starting a program (launch_app, or run_action with spawn) asks the user the same way; without a dialog it returns a code for confirm_launch, which you may use only after the user agrees. When the user asks for a screenshot or a recording without saying what to capture, set ask_user_what_to_capture so they choose the whole screen, a monitor or a window; when you capture for your own purposes, leave it unset so you are never kept waiting.\n\nThe mouse and keyboard are the user's own, on a desktop they may be using at the same time. Ask the user before you click, type or press keys in their windows, unless they asked you to. Prefer capturing one window by window_id over whole monitors: it is sharper and leaves out their other windows. Pass window_id to type_text and key_press so nothing is typed when another window has focus, and to mouse_click to click at coordinates inside that window. After acting, use wait_for_change (it compares with your previous capture of the same window) or wait_for_text instead of sleeping and re-capturing. If focus or a window title changed without you, the user is probably using the desktop: stop and ask."
 )]
 impl ServerHandler for UmbrielServer {
     async fn call_tool(
@@ -1995,6 +1997,9 @@ enum Command {
         /// Restrict the registered server to this profile (default: no restriction)
         #[arg(long, value_enum)]
         profile: Option<Profile>,
+        /// For pi, do not install the extension that shows approval dialogs
+        #[arg(long)]
+        no_extension: bool,
     },
     /// Unregister umbriel-mcp from every harness and remove this binary
     Uninstall {
@@ -2013,7 +2018,11 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     match cli.command {
         Some(Command::Doctor) => return Ok(doctor::run()),
         Some(Command::Update { check }) => return Ok(update::run(check)),
-        Some(Command::Install { harness, profile }) => return Ok(register::run(harness, profile)),
+        Some(Command::Install {
+            harness,
+            profile,
+            no_extension,
+        }) => return Ok(register::run(harness, profile, !no_extension)),
         Some(Command::Uninstall { yes, keep_binary }) => {
             return Ok(uninstall::run(yes, keep_binary));
         }
